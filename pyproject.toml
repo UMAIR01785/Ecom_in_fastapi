@@ -1,0 +1,20 @@
+[project]
+name = "ecom-in-fast"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.0",
+    "cloudinary>=1.46.2",
+    "fastapi>=0.141.1",
+    "phonenumbers>=9.0.39",
+    "psycopg2-binary>=2.9.13",
+    "pwdlib[argon2]>=0.3.1",
+    "pydantic[email]>=2.13.5",
+    "pyjwt>=2.14.0",
+    "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.32",
+    "sqlalchemy>=2.0.52",
+    "uvicorn>=0.53.0",
+]
