@@ -1,8 +1,27 @@
 import cloudinary
-import os
+import cloudinary.uploader
+
+from app.config import settings
+
 
 cloudinary.config(
-    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME"),
-    api_key=os.getenv("CLOUDINARY_API_KEY"),
-    api_secret=os.getenv("CLOUDINARY_API_SECRET"),
+    cloud_name=settings.cloudinary_cloud_name,
+    api_key=settings.cloudinary_api_key,
+    api_secret=settings.cloudinary_api_secret,
 )
+
+
+def upload_profile_image(file_data: bytes):
+    result = cloudinary.uploader.upload(
+        file_data,
+        folder="ecommerce/profile_images"
+    )
+
+    return {
+        "url": result["secure_url"],
+        "public_id": result["public_id"],
+    }
+def delete_profile_image(public_id: str):
+    result = cloudinary.uploader.destroy(public_id)
+
+    return result

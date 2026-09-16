@@ -1,45 +1,46 @@
 from sqlalchemy import ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from typing import TYPE_CHECKING
+
 from app.database import Base
 
-if TYPE_CHECKING:
-    from app.models.user import User
-    
+
 class Profile(Base):
     __tablename__ = "profiles"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-        index=True
-    )
+    id: Mapped[int] = mapped_column(primary_key=True)
 
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"),
+        ForeignKey("users.id"),
         unique=True,
-        nullable=False
+        nullable=False,
     )
 
     profile_picture: Mapped[str | None] = mapped_column(
         String(500),
-        nullable=True
+        nullable=True,
+    )
+
+    profile_picture_public_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
     )
 
     bio: Mapped[str | None] = mapped_column(
         Text,
-        nullable=True
+        nullable=True,
     )
 
     address: Mapped[str | None] = mapped_column(
         String(255),
-        nullable=True
+        nullable=True,
     )
 
     city: Mapped[str | None] = mapped_column(
         String(100),
-        nullable=True
+        nullable=True,
     )
 
-    user: Mapped["User"] = relationship(
-        back_populates="profile"
-    )   
+    user = relationship(
+        "User",
+        back_populates="profile",
+    )

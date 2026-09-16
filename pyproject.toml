@@ -11,6 +11,7 @@ dependencies = [
     "phonenumbers>=9.0.39",
     "psycopg2-binary>=2.9.13",
     "pwdlib[argon2]>=0.3.1",
+    "pydantic-settings>=2.15.0",
     "pydantic[email]>=2.13.5",
     "pyjwt>=2.14.0",
     "python-dotenv>=1.2.3",

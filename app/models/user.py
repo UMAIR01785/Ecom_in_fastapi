@@ -1,10 +1,13 @@
-from sqlalchemy import String
+from sqlalchemy import String,Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import TYPE_CHECKING
 from app.database import Base
-
+from enum import Enum
 if TYPE_CHECKING:
     from app.models.profile import Profile
+class UserRole(str, Enum):
+    CUSTOMER = "customer"
+    ADMIN = "admin"
 
 class User(Base):
     __tablename__ = "users"
@@ -32,7 +35,9 @@ class User(Base):
         unique=True,
         nullable=False
     )
-
+    role: Mapped[UserRole] = mapped_column(
+            default=UserRole.CUSTOMER
+        )
     password_hash: Mapped[str] = mapped_column(
         String(255),
         nullable=False
@@ -49,3 +54,10 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan"
     )
+    
+    
+    is_active: Mapped[bool] = mapped_column(
+    Boolean,
+    default=True,
+    nullable=False
+)

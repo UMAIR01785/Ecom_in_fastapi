@@ -3,15 +3,17 @@ from sqlalchemy.orm import Session
 from pwdlib import PasswordHash
 from app.core.security import create_access_token
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User,UserRole
 from app.models.profile import Profile
-
+from fastapi.security import OAuth2PasswordBearer
 from app.schemas.user import UserCreate, UserResponse,UserLogin
 
+from app.dependencies.auth import get_current_user
 
 router = APIRouter(prefix="/accounts", tags=["Authentication"])
 
 password_hash = PasswordHash.recommended()
+
 
 
 @router.post("/register", response_model=UserResponse)
@@ -62,6 +64,7 @@ def register(
         username=user_data.username,
         password_hash=hashed_password,
         phone_number=user_data.phone_number,
+        role=UserRole.CUSTOMER
     )
 
     # 6. Save to database
@@ -79,12 +82,6 @@ def register(
     return new_user
 
 
-@router.get("/user" ,response_model=list[UserResponse] )
-def get_user(db:Session = Depends(get_db)):
-    user = db.query(User).all()
-    
-    
-    return user
 
 @router.post("/login")
 def login(
@@ -120,3 +117,4 @@ def login(
     "access_token": access_token,
     "token_type": "bearer"
 }
+    
