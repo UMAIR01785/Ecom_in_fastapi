@@ -54,6 +54,7 @@ def get_profile(
         "email": profile.user.email,
         "username": profile.user.username,
         "phone_number": profile.user.phone_number,
+        "role": profile.user.role.value,
 
         # Profile fields
         "profile_picture": profile.profile_picture,
@@ -124,6 +125,7 @@ def update_profile(
         "email": current_user.email,
         "username": current_user.username,
         "phone_number": current_user.phone_number,
+        "role": current_user.role.value,
 
         # Profile
         "profile_picture": profile.profile_picture,

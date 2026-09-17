@@ -25,3 +25,22 @@ def delete_profile_image(public_id: str):
     result = cloudinary.uploader.destroy(public_id)
 
     return result
+
+
+import cloudinary.uploader
+from fastapi import UploadFile
+
+
+async def upload_category_image(
+    file: UploadFile,
+) -> str:
+
+    contents = await file.read()
+
+    result = cloudinary.uploader.upload(
+        contents,
+        folder="ecommerce/categories",
+    )
+
+    return result["secure_url"]
+    

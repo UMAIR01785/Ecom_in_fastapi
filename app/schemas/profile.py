@@ -11,6 +11,7 @@ class ProfileResponse(BaseModel):
     email: str
     username: str
     phone_number: str
+    role: str
 
     # Profile fields
     profile_picture: str | None = None

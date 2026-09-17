@@ -1,4 +1,3 @@
-
 from datetime import datetime
 
 from sqlalchemy import String, Text, DateTime, Boolean
@@ -7,9 +6,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
 
-
 class Category(Base):
-    
+
     __tablename__ = "categories"
 
     id: Mapped[int] = mapped_column(
@@ -36,7 +34,7 @@ class Category(Base):
     )
 
     image: Mapped[str | None] = mapped_column(
-        String,
+        String(500),
         nullable=True,
     )
 
@@ -45,15 +43,16 @@ class Category(Base):
         default=True,
         nullable=False,
     )
-   
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
+        nullable=False,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
+        nullable=False,
     )
