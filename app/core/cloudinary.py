@@ -43,4 +43,18 @@ async def upload_category_image(
     )
 
     return result["secure_url"]
+
+
+async def upload_product_image(
+    file: UploadFile,
+) -> str:
+
+    contents = await file.read()
+
+    result = cloudinary.uploader.upload(
+        contents,
+        folder="ecommerce/Products",
+    )
+
+    return result["secure_url"]
     
