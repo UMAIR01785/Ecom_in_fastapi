@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ProductCreate(BaseModel):
+
     name: str = Field(
         ...,
         min_length=2,
@@ -27,13 +28,16 @@ class ProductCreate(BaseModel):
         ge=0
     )
 
-    category_id: int = Field(
+    category_slugs: list[str] = Field(
         ...,
-        gt=0
+        min_length=1
     )
+
     is_active: bool | None = None
 
+
 class ProductUpdate(BaseModel):
+
     name: str | None = Field(
         default=None,
         min_length=2,
@@ -56,22 +60,25 @@ class ProductUpdate(BaseModel):
         ge=0
     )
 
-    category_id: int | None = Field(
+    category_slugs: list[str] | None = Field(
         default=None,
-        gt=0
+        min_length=1
     )
 
     is_active: bool | None = None
 
 
 class ProductResponse(BaseModel):
+
     id: int
     name: str
     slug: str
     description: str | None
     price: Decimal
     stock: int
-    category_id: int
+
+    category_slugs: list[str]
+
     image: str | None
     is_active: bool
     created_at: datetime

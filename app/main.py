@@ -4,6 +4,7 @@ from app.routers.profile import router as profile_router
 from fastapi.middleware.cors import CORSMiddleware
 from app.routers.category import router as category_router
 from app.routers.product import router as product_router
+from app.routers.cart import router as cart_router
 app = FastAPI(
     title="E-Commerce API",
     description="Backend API for an e-commerce platform",
@@ -13,6 +14,7 @@ app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(category_router)
 app.include_router(product_router, prefix="/products")
+app.include_router(cart_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],

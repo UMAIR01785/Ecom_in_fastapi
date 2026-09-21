@@ -1,10 +1,24 @@
 from datetime import datetime
 
-from sqlalchemy import String, Text, DateTime, Boolean
-from sqlalchemy.orm import Mapped, mapped_column,relationship
+from sqlalchemy import (
+    String,
+    Text,
+    DateTime,
+    Boolean,
+)
+from sqlalchemy.orm import (
+    Mapped,
+    mapped_column,
+    relationship,
+)
 
 from app.database import Base
-from app.models.product import Product
+from app.models.product import product_categories
+
+
+# =========================================================
+# Category Model
+# =========================================================
 
 class Category(Base):
 
@@ -56,8 +70,13 @@ class Category(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
-    
+
+    # =====================================================
+    # Many-to-Many Relationship
+    # =====================================================
+
     products = relationship(
-    "Product",
-    back_populates="category"
-)
+        "Product",
+        secondary=product_categories,
+        back_populates="categories",
+    )

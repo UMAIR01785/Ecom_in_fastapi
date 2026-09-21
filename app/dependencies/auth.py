@@ -13,6 +13,10 @@ oauth2_scheme = OAuth2PasswordBearer(
 )
 
 
+# -----------------------------------------
+# REQUIRED AUTHENTICATION
+# -----------------------------------------
+
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
@@ -47,5 +51,45 @@ def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found"
         )
+
+    return user
+
+
+# -----------------------------------------
+# OPTIONAL AUTHENTICATION
+# -----------------------------------------
+
+oauth2_scheme_optional = OAuth2PasswordBearer(
+    tokenUrl="/accounts/login",
+    auto_error=False
+)
+
+
+def get_optional_current_user(
+    token: str | None = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db)
+):
+    # No token = guest
+    if token is None:
+        return None
+
+    try:
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM]
+        )
+
+        user_id = payload.get("sub")
+
+        if user_id is None:
+            return None
+
+    except jwt.InvalidTokenError:
+        return None
+
+    user = db.query(User).filter(
+        User.id == int(user_id)
+    ).first()
 
     return user

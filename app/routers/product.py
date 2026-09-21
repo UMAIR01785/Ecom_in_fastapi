@@ -1,3 +1,4 @@
+
 from app.utils.slug import generate_slug
 
 from fastapi import (
@@ -9,6 +10,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+
 from sqlalchemy.orm import Session
 
 from app.core.cloudinary import upload_product_image
@@ -39,27 +41,36 @@ async def create_product(
     description: str = Form(None),
     price: float = Form(...),
     stock: int = Form(...),
-    category_slug: str = Form(...),
+
+    # Multiple category slugs
+    category_slugs: list[str] = Form(...),
+
     is_active: bool = Form(True),
     image: UploadFile | None = File(None),
 
     db: Session = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    # Find category
-    category = (
+    # --------------------------------------------------------
+    # Find categories
+    # --------------------------------------------------------
+
+    categories = (
         db.query(Category)
-        .filter(Category.slug == category_slug)
-        .first()
+        .filter(Category.slug.in_(category_slugs))
+        .all()
     )
 
-    if not category:
+    if len(categories) != len(category_slugs):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Category not found",
+            detail="One or more categories not found",
         )
 
+    # --------------------------------------------------------
     # Check duplicate product name
+    # --------------------------------------------------------
+
     existing_product = (
         db.query(Product)
         .filter(Product.name == name)
@@ -72,10 +83,16 @@ async def create_product(
             detail="Product with this name already exists",
         )
 
+    # --------------------------------------------------------
     # Generate product slug
+    # --------------------------------------------------------
+
     slug = generate_slug(name)
 
+    # --------------------------------------------------------
     # Check duplicate slug
+    # --------------------------------------------------------
+
     existing_slug = (
         db.query(Product)
         .filter(Product.slug == slug)
@@ -88,22 +105,30 @@ async def create_product(
             detail="Product with this slug already exists",
         )
 
+    # --------------------------------------------------------
     # Upload image
+    # --------------------------------------------------------
+
     image_url = None
 
     if image:
         image_url = await upload_product_image(image)
 
+    # --------------------------------------------------------
     # Create product
+    # --------------------------------------------------------
+
     product = Product(
         name=name,
         slug=slug,
         description=description,
         price=price,
         stock=stock,
-        category_id=category.id,
         image=image_url,
         is_active=is_active,
+
+        # Many-to-many relationship
+        categories=categories,
     )
 
     db.add(product)
@@ -156,7 +181,7 @@ def get_products(
 
 # ============================================================
 # CUSTOMER - GET PRODUCTS BY CATEGORY
-# Example: GET /mobile
+# Example: GET /shoes
 # ============================================================
 
 @router.get(
@@ -167,7 +192,10 @@ def get_products_by_category(
     category_slug: str,
     db: Session = Depends(get_db),
 ):
+    # --------------------------------------------------------
     # Find category
+    # --------------------------------------------------------
+
     category = (
         db.query(Category)
         .filter(Category.slug == category_slug)
@@ -180,11 +208,16 @@ def get_products_by_category(
             detail="Category not found",
         )
 
-    # Get only active products from category
+    # --------------------------------------------------------
+    # Get active products belonging to this category
+    # --------------------------------------------------------
+
     products = (
         db.query(Product)
         .filter(
-            Product.category_id == category.id,
+            Product.categories.any(
+                Category.id == category.id
+            ),
             Product.is_active == True,
         )
         .all()
@@ -195,7 +228,8 @@ def get_products_by_category(
 
 # ============================================================
 # CUSTOMER - GET SINGLE PRODUCT
-# Example: GET /mobile/iphone-17-pro-max
+# Example:
+# GET /shoes/nike-air-max
 # ============================================================
 
 @router.get(
@@ -207,7 +241,10 @@ def get_product(
     product_slug: str,
     db: Session = Depends(get_db),
 ):
+    # --------------------------------------------------------
     # Find category
+    # --------------------------------------------------------
+
     category = (
         db.query(Category)
         .filter(Category.slug == category_slug)
@@ -220,12 +257,19 @@ def get_product(
             detail="Category not found",
         )
 
-    # Find only active product inside category
+    # --------------------------------------------------------
+    # Find product inside category
+    # --------------------------------------------------------
+
     product = (
         db.query(Product)
         .filter(
             Product.slug == product_slug,
-            Product.category_id == category.id,
+
+            Product.categories.any(
+                Category.id == category.id
+            ),
+
             Product.is_active == True,
         )
         .first()
@@ -242,7 +286,8 @@ def get_product(
 
 # ============================================================
 # UPDATE PRODUCT
-# Example: PUT /mobile/iphone-17-pro-max
+# Example:
+# PUT /shoes/nike-air-max
 # ============================================================
 
 @router.put(
@@ -259,15 +304,18 @@ async def update_product(
     stock: int | None = Form(None),
     is_active: bool | None = Form(None),
 
-    # Use this when moving product to another category
-    new_category_slug: str | None = Form(None),
+    # Replace product categories
+    category_slugs: list[str] | None = Form(None),
 
     image: UploadFile | None = File(None),
 
     db: Session = Depends(get_db),
     current_user=Depends(admin_required),
 ):
+    # --------------------------------------------------------
     # Find current category
+    # --------------------------------------------------------
+
     category = (
         db.query(Category)
         .filter(Category.slug == category_slug)
@@ -280,12 +328,18 @@ async def update_product(
             detail="Category not found",
         )
 
+    # --------------------------------------------------------
     # Find product inside current category
+    # --------------------------------------------------------
+
     product = (
         db.query(Product)
         .filter(
             Product.slug == product_slug,
-            Product.category_id == category.id,
+
+            Product.categories.any(
+                Category.id == category.id
+            ),
         )
         .first()
     )
@@ -304,7 +358,6 @@ async def update_product(
 
         new_slug = generate_slug(name)
 
-        # Check duplicate slug
         existing_product = (
             db.query(Product)
             .filter(
@@ -352,24 +405,25 @@ async def update_product(
         product.is_active = is_active
 
     # --------------------------------------------------------
-    # Change category
+    # Update categories
     # --------------------------------------------------------
 
-    if new_category_slug is not None:
+    if category_slugs is not None:
 
-        new_category = (
+        categories = (
             db.query(Category)
-            .filter(Category.slug == new_category_slug)
-            .first()
+            .filter(Category.slug.in_(category_slugs))
+            .all()
         )
 
-        if not new_category:
+        if len(categories) != len(category_slugs):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="New category not found",
+                detail="One or more categories not found",
             )
 
-        product.category_id = new_category.id
+        # Replace existing categories
+        product.categories = categories
 
     # --------------------------------------------------------
     # Update image
@@ -386,7 +440,8 @@ async def update_product(
 
 # ============================================================
 # DELETE PRODUCT
-# Example: DELETE /mobile/iphone-17-pro-max
+# Example:
+# DELETE /shoes/nike-air-max
 # ============================================================
 
 @router.delete(
@@ -400,7 +455,10 @@ def delete_product(
     db: Session = Depends(get_db),
     current_user=Depends(admin_required),
 ):
+    # --------------------------------------------------------
     # Find category
+    # --------------------------------------------------------
+
     category = (
         db.query(Category)
         .filter(Category.slug == category_slug)
@@ -413,12 +471,18 @@ def delete_product(
             detail="Category not found",
         )
 
+    # --------------------------------------------------------
     # Find product
+    # --------------------------------------------------------
+
     product = (
         db.query(Product)
         .filter(
             Product.slug == product_slug,
-            Product.category_id == category.id,
+
+            Product.categories.any(
+                Category.id == category.id
+            ),
         )
         .first()
     )
@@ -429,7 +493,10 @@ def delete_product(
             detail="Product not found in this category",
         )
 
+    # --------------------------------------------------------
     # Soft delete
+    # --------------------------------------------------------
+
     product.is_active = False
 
     db.commit()
@@ -437,3 +504,4 @@ def delete_product(
     return {
         "message": "Product deleted successfully"
     }
+

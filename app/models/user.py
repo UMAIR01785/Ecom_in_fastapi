@@ -3,8 +3,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from typing import TYPE_CHECKING
 from app.database import Base
 from enum import Enum
+
 if TYPE_CHECKING:
     from app.models.profile import Profile
+    from app.models.cart import Cart
 class UserRole(str, Enum):
     CUSTOMER = "customer"
     ADMIN = "admin"
@@ -54,6 +56,12 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan"
     )
+    
+    cart: Mapped["Cart | None"] = relationship(
+    "Cart",
+    back_populates="user",
+    uselist=False
+)
     
     
     is_active: Mapped[bool] = mapped_column(
