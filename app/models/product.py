@@ -1,5 +1,5 @@
 from datetime import datetime
-
+from decimal import Decimal
 from sqlalchemy import (
     Boolean,
     DateTime,
@@ -69,7 +69,7 @@ class Product(Base):
         nullable=True,
     )
 
-    price: Mapped[float] = mapped_column(
+    price: Mapped[Decimal] = mapped_column(
         Numeric(10, 2),
         nullable=False,
     )
@@ -90,6 +90,10 @@ class Product(Base):
         default=True,
         nullable=False,
     )
+    orders = relationship(
+    "OrderItem",
+    back_populates="product",
+)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
