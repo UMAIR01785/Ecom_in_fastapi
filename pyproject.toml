@@ -15,7 +15,8 @@ dependencies = [
     "pydantic[email]>=2.13.5",
     "pyjwt>=2.14.0",
     "python-dotenv>=1.2.3",
+    "python-jose[cryptography]>=3.5.0",
     "python-multipart>=0.0.32",
     "sqlalchemy>=2.0.52",
-    "uvicorn>=0.53.0",
+    "uvicorn[standard]>=0.53.0",
 ]

@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta, timezone
 import jwt
+from dotenv import load_dotenv
+
+load_dotenv()
+import os
 
 
-SECRET_KEY = "your-super-secret-key"
-ALGORITHM = "HS256"
+SECRET_KEY = os.getenv("SECRET_KEY")
+ALGORITHM = os.getenv("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 from pwdlib import PasswordHash

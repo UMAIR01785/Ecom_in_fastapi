@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends ,HTTPException,status
+from fastapi import APIRouter, Depends, status,HTTPException
 from sqlalchemy.orm import Session, joinedload
+from app.websockets.manager import manager
 from app.schemas.admin_order import OrderStatusUpdate
 from app.database import get_db
-from app.models.order import Order,OrderItem
+from app.models.order import Order, OrderItem
 from app.models.user import User
-from app.models.order import OrderStatus
 from app.dependencies.permissions import admin_required
+from app.services.oder_servies import update_order_status
 
 
 router = APIRouter(
@@ -34,36 +35,17 @@ def get_all_orders(
 
 
 @router.patch("/{order_id}/status")
-def update_order_status(
+async def update_order_status_admin(
     order_id: int,
     data: OrderStatusUpdate,
     db: Session = Depends(get_db),
     current_admin: User = Depends(admin_required),
 ):
-    order = (
-        db.query(Order)
-        .filter(Order.id == order_id)
-        .first()
+    return await update_order_status(
+        db=db,
+        order_id=order_id,
+        new_status=data.status,
     )
-
-    if not order:
-        raise HTTPException(
-            status_code=404,
-            detail="Order not found"
-        )
-
-    if order.status == OrderStatus.CANCELLED:
-        raise HTTPException(
-            status_code=400,
-            detail="Cancelled orders cannot be updated"
-        )
-
-    order.status = data.status
-
-    db.commit()
-    db.refresh(order)
-
-    return order
 
 
 @router.get("/{order_id}")

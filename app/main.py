@@ -5,6 +5,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routers.category import router as category_router
 from app.routers.product import router as product_router
 from app.routers.cart import router as cart_router
+from app.routers.websocket import router as websocket_router
+
 from app.routers.order import router as order_router
 from app.routers.admin_oder import router as admin_router
 app = FastAPI(
@@ -12,6 +14,9 @@ app = FastAPI(
     description="Backend API for an e-commerce platform",
     version="1.0.0"
 )
+
+
+app.include_router(websocket_router)
 app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(category_router)

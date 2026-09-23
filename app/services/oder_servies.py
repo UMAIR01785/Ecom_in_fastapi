@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, joinedload
-
+from app.websockets.manager import manager
 from app.models.cart import Cart, CartItem
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
@@ -250,3 +250,90 @@ def cancel_order(
 
     return order
 
+
+
+ALLOWED_TRANSITIONS = {
+    OrderStatus.PENDING: {
+        OrderStatus.CONFIRMED,
+        OrderStatus.CANCELLED,
+    },
+    OrderStatus.CONFIRMED: {
+        OrderStatus.PROCESSING,
+    },
+    OrderStatus.PROCESSING: {
+        OrderStatus.SHIPPED,
+    },
+    OrderStatus.SHIPPED: {
+        OrderStatus.DELIVERED,
+    },
+    OrderStatus.DELIVERED: set(),
+    OrderStatus.CANCELLED: set(),
+}
+
+
+async def update_order_status(
+    db: Session,
+    order_id: int,
+    new_status: OrderStatus,
+):
+    # 1. Get and lock the order
+    order = (
+        db.query(Order)
+        .filter(Order.id == order_id)
+        .with_for_update()
+        .first()
+    )
+
+    if not order:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Order not found",
+        )
+
+    # 2. Get allowed next statuses
+    allowed_statuses = ALLOWED_TRANSITIONS[order.status]
+
+    # 3. Check whether transition is valid
+    if new_status not in allowed_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot change order status "
+                f"from '{order.status.value}' "
+                f"to '{new_status.value}'"
+            ),
+        )
+
+    # 4. Change status
+    order.status = new_status
+
+    # 5. Save transaction
+    try:
+        db.commit()
+
+    except Exception:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update order status",
+        )
+
+    # 6. Reload updated order
+    db.refresh(order)
+     # --------------------------------------------------------
+    # 7. Send real-time WebSocket event
+    # --------------------------------------------------------
+
+    await manager.send_to_user(
+        order.user_id,
+        {
+            "event": "order_status_updated",
+            "data": {
+                "order_id": order.id,
+                "status": order.status.value,
+            },
+        },
+    )
+
+    return order
