@@ -49,17 +49,21 @@ def get_my_orders(
     current_user: User = Depends(get_current_user),
 ):
     orders = (
-        db.query(Order)
-        .options(
-            joinedload(Order.items)
-            .joinedload(OrderItem.product)
-        )
-        .filter(
-            Order.user_id == current_user.id
-        )
-        .order_by(Order.created_at.desc())
-        .all()
+    db.query(Order)
+    .options(
+        joinedload(Order.items)
+        .joinedload(OrderItem.product),
+
+        joinedload(Order.payment),
     )
+    .filter(
+        Order.user_id == current_user.id
+    )
+    .order_by(
+        Order.created_at.desc()
+    )
+    .all()
+)
 
     return orders
 
@@ -74,17 +78,19 @@ def get_order(
     current_user: User = Depends(get_current_user),
 ):
     order = (
-        db.query(Order)
-        .options(
-            joinedload(Order.items)
-            .joinedload(OrderItem.product)
-        )
-        .filter(
-            Order.id == order_id,
-            Order.user_id == current_user.id,
-        )
-        .first()
+    db.query(Order)
+    .options(
+        joinedload(Order.items)
+        .joinedload(OrderItem.product),
+
+        joinedload(Order.payment),
     )
+    .filter(
+        Order.id == order_id,
+        Order.user_id == current_user.id,
+    )
+    .first()
+)
 
     if not order:
         raise HTTPException(
