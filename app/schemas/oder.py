@@ -2,12 +2,15 @@ from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, model_validator
-
+from app.models.payment import PaymentMethod
 from app.models.order import OrderStatus
 
 
 class CheckoutRequest(BaseModel):
-    shipping_address: str
+    shipping_address: str 
+
+    payment_method: PaymentMethod
+    
 
 
 class OrderItemResponse(BaseModel):
@@ -46,3 +49,8 @@ class OrderResponse(BaseModel):
     items: list[OrderItemResponse]
 
     model_config = ConfigDict(from_attributes=True)
+    
+class CheckoutResponse(BaseModel):
+    payment_method: PaymentMethod
+    order: OrderResponse | None = None
+    payment_url: str | None = None

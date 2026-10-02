@@ -9,6 +9,7 @@ from app.routers.websocket import router as websocket_router
 
 from app.routers.order import router as order_router
 from app.routers.admin_oder import router as admin_router
+from app.routers import payment
 app = FastAPI(
     title="E-Commerce API",
     description="Backend API for an e-commerce platform",
@@ -24,6 +25,7 @@ app.include_router(product_router, prefix="/products")
 app.include_router(cart_router)
 app.include_router(order_router)
 app.include_router(admin_router)
+app.include_router(payment.router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],

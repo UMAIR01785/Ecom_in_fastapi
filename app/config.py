@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     secret_key: str
     algorithm: str
 
+    stripe_secret_key: str
+    stripe_webhook_secret: str
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8"

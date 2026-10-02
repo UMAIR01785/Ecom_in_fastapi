@@ -1,6 +1,8 @@
 import cloudinary
 import cloudinary.uploader
 
+import cloudinary.uploader
+from fastapi import UploadFile
 from app.config import settings
 
 
@@ -27,8 +29,6 @@ def delete_profile_image(public_id: str):
     return result
 
 
-import cloudinary.uploader
-from fastapi import UploadFile
 
 
 async def upload_category_image(
