@@ -2,23 +2,35 @@
 
 Revision ID: c9f5d3a39992
 Revises: 03b5ba3e8e41
-Create Date: 2026-09-28 15:31:27.930376
 """
-
-from typing import Sequence, Union
-
 from alembic import op
 import sqlalchemy as sa
 
 
-# revision identifiers, used by Alembic.
-revision: str = "c9f5d3a39992"
-down_revision: Union[str, Sequence[str], None] = "03b5ba3e8e41"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+revision = "c9f5d3a39992"
+down_revision = "03b5ba3e8e41"
+branch_labels = None
+depends_on = None
 
 
-def upgrade() -> None:
+def upgrade():
+    payment_method = sa.Enum(
+        "card",
+        "cod",
+        name="paymentmethod",
+    )
+
+    payment_status = sa.Enum(
+        "pending",
+        "paid",
+        "failed",
+        "refunded",
+        name="paymentstatus",
+    )
+
+    payment_method.create(op.get_bind(), checkfirst=True)
+    payment_status.create(op.get_bind(), checkfirst=True)
+
     op.create_table(
         "payments",
 
@@ -26,7 +38,6 @@ def upgrade() -> None:
             "id",
             sa.Integer(),
             primary_key=True,
-            nullable=False,
         ),
 
         sa.Column(
@@ -44,23 +55,13 @@ def upgrade() -> None:
 
         sa.Column(
             "method",
-            sa.Enum(
-                "COD",
-                "CARD",
-                name="paymentmethod",
-            ),
+            payment_method,
             nullable=False,
         ),
 
         sa.Column(
             "status",
-            sa.Enum(
-                "PENDING",
-                "PAID",
-                "FAILED",
-                "CANCELLED",
-                name="paymentstatus",
-            ),
+            payment_status,
             nullable=False,
         ),
 
@@ -74,6 +75,7 @@ def upgrade() -> None:
             "transaction_id",
             sa.String(255),
             nullable=True,
+            unique=True,
         ),
 
         sa.Column(
@@ -89,20 +91,46 @@ def upgrade() -> None:
         ),
     )
 
+    op.create_index(
+        "ix_payments_order_id",
+        "payments",
+        ["order_id"],
+    )
 
-def downgrade() -> None:
+    op.create_index(
+        "ix_payments_session_id",
+        "payments",
+        ["session_id"],
+    )
+
+
+def downgrade():
+
+    op.drop_index(
+        "ix_payments_session_id",
+        table_name="payments",
+    )
+
+    op.drop_index(
+        "ix_payments_order_id",
+        table_name="payments",
+    )
+
     op.drop_table("payments")
 
-    sa.Enum(
-        "COD",
-        "CARD",
-        name="paymentmethod",
-    ).drop(op.get_bind(), checkfirst=True)
-
-    sa.Enum(
-        "PENDING",
-        "PAID",
-        "FAILED",
-        "CANCELLED",
+    payment_status = sa.Enum(
+        "pending",
+        "paid",
+        "failed",
+        "refunded",
         name="paymentstatus",
-    ).drop(op.get_bind(), checkfirst=True)
+    )
+
+    payment_method = sa.Enum(
+        "card",
+        "cod",
+        name="paymentmethod",
+    )
+
+    payment_status.drop(op.get_bind(), checkfirst=True)
+    payment_method.drop(op.get_bind(), checkfirst=True)

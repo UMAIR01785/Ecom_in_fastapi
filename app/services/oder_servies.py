@@ -20,15 +20,15 @@ from app.services.payment_service import create_payment_session
 # CHECKOUT
 # ============================================================
 
+
 async def checkout_cart(
     db: Session,
     current_user: User,
     shipping_address: str,
     payment_method: PaymentMethod,
 ):
-
     # ========================================================
-    # 1. Get user's cart
+    # 1. Get cart
     # ========================================================
 
     cart = (
@@ -49,10 +49,6 @@ async def checkout_cart(
             detail="Cart not found",
         )
 
-    # ========================================================
-    # 2. Check empty cart
-    # ========================================================
-
     if not cart.items:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -60,7 +56,7 @@ async def checkout_cart(
         )
 
     # ========================================================
-    # 3. Lock products + validate stock + calculate total
+    # 2. Validate products and calculate total
     # ========================================================
 
     total_amount = Decimal("0.00")
@@ -71,9 +67,7 @@ async def checkout_cart(
 
         product = (
             db.query(Product)
-            .filter(
-                Product.id == cart_item.product.id
-            )
+            .filter(Product.id == cart_item.product_id)
             .with_for_update()
             .first()
         )
@@ -81,14 +75,8 @@ async def checkout_cart(
         if not product:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="A product in your cart no longer exists",
+                detail="Product no longer exists",
             )
-
-        locked_products[product.id] = product
-
-        # ----------------------------------------------------
-        # Product inactive
-        # ----------------------------------------------------
 
         if not product.is_active:
             raise HTTPException(
@@ -99,10 +87,6 @@ async def checkout_cart(
                 ),
             )
 
-        # ----------------------------------------------------
-        # Check stock
-        # ----------------------------------------------------
-
         if product.stock < cart_item.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -112,81 +96,137 @@ async def checkout_cart(
                 ),
             )
 
-        # ----------------------------------------------------
-        # Calculate total using current DB price
-        # ----------------------------------------------------
+        locked_products[product.id] = product
 
         total_amount += (
             product.price * cart_item.quantity
         )
 
     # ========================================================
-    # 4. COD FLOW
+    # 3. Create Order
+    # ========================================================
+
+    order = Order(
+        user_id=current_user.id,
+        total_amount=total_amount,
+        status=OrderStatus.PENDING,
+        shipping_address=shipping_address,
+    )
+
+    db.add(order)
+
+    # Get generated order.id
+    db.flush()
+
+    # ========================================================
+    # 4. Create OrderItems
+    # ========================================================
+
+    for cart_item in cart.items:
+
+        product = locked_products[
+            cart_item.product_id
+        ]
+
+        order_item = OrderItem(
+            order_id=order.id,
+            product_id=product.id,
+            quantity=cart_item.quantity,
+            unit_price=product.price,
+        )
+
+        db.add(order_item)
+
+    # ========================================================
+    # 5. Create Payment
+    # ========================================================
+
+    payment = Payment(
+        order_id=order.id,
+        amount=total_amount,
+        method=payment_method,
+        status=PaymentStatus.PENDING,
+    )
+
+    db.add(payment)
+
+    # Get generated payment.id
+    db.flush()
+
+    # ========================================================
+    # 6. CARD
+    # ========================================================
+
+    if payment_method == PaymentMethod.CARD:
+        
+        if total_amount < Decimal("140.00"):
+            raise HTTPException(
+                status_code=400,
+                detail="Card payment requires a higher order amount."
+            )
+
+        try:
+
+            payment_session = await create_payment_session(
+                order=order,
+                payment=payment,
+            )
+
+            payment.session_id = payment_session.id
+
+            # We can commit the Order + Payment +
+            # Stripe session ID together.
+            db.commit()
+
+        except Exception:
+
+            db.rollback()
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unable to create payment session",
+            )
+
+        db.refresh(order)
+        db.refresh(payment)
+
+        # Clear cart after checkout snapshot has been created.
+        for cart_item in list(cart.items):
+            db.delete(cart_item)
+
+        db.commit()
+
+        db.refresh(order)
+
+        return {
+            "payment_method": PaymentMethod.CARD,
+            "order": order,
+            "payment_url": payment_session.url,
+        }
+
+    # ========================================================
+    # 7. COD
     # ========================================================
 
     if payment_method == PaymentMethod.COD:
+        
 
-        # ----------------------------------------------------
-        # Create Order
-        # ----------------------------------------------------
+        # For COD, order is accepted immediately.
+        # Payment remains pending because customer
+        # pays when receiving the order.
 
-        order = Order(
-            user_id=current_user.id,
-            status=OrderStatus.PENDING,
-            total_amount=total_amount,
-            shipping_address=shipping_address,
-        )
+        order.status = OrderStatus.CONFIRMED
 
-        db.add(order)
-
-        # Generate order.id
-        db.flush()
-
-        # ----------------------------------------------------
-        # Create OrderItems + decrease stock
-        # ----------------------------------------------------
-
+        # Reserve/decrease stock now.
         for cart_item in cart.items:
 
             product = locked_products[
-                cart_item.product.id
+                cart_item.product_id
             ]
 
-            order_item = OrderItem(
-                order_id=order.id,
-                product_id=product.id,
-                quantity=cart_item.quantity,
-                unit_price=product.price,
-            )
-
-            db.add(order_item)
-
-            # Reserve/remove stock
             product.stock -= cart_item.quantity
 
-        # ----------------------------------------------------
-        # Create COD Payment
-        # ----------------------------------------------------
-
-        payment = Payment(
-            order_id=order.id,
-            amount=total_amount,
-            method=PaymentMethod.COD,
-            status=PaymentStatus.PENDING,
-        )
-
-        db.add(payment)
-
-        # ----------------------------------------------------
-        # Clear cart
-        # ----------------------------------------------------
-
-        for cart_item in cart.items:
             db.delete(cart_item)
-
-        # ----------------------------------------------------
-        # Commit everything
-        # ----------------------------------------------------
 
         try:
 
@@ -201,109 +241,33 @@ async def checkout_cart(
                 detail="COD checkout failed",
             )
 
-        # ----------------------------------------------------
-        # Refresh
-        # ----------------------------------------------------
-
         db.refresh(order)
+
+        try:
+
+            await manager.send_to_admin({
+                "type": "new_order",
+                "order_id": order.id,
+                "user_id": order.user_id,
+                "total_amount": str(order.total_amount),
+                "status": order.status.value,
+            })
+
+        except Exception:
+            # WebSocket failure must not
+            # undo the database transaction.
+            pass
 
         return {
             "payment_method": PaymentMethod.COD,
             "order": order,
-            "payment": payment,
             "payment_url": None,
         }
-
-    # ========================================================
-    # 5. CARD FLOW
-    # ========================================================
-
-    if payment_method == PaymentMethod.CARD:
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # DO NOT create Order
-        # DO NOT create OrderItem
-        # DO NOT decrease stock
-        #
-        # because payment has not succeeded yet.
-        # ----------------------------------------------------
-
-        payment = Payment(
-    order_id=order.id,
-    amount=order.total_amount,
-    method=PaymentMethod.CARD,
-    status=PaymentStatus.PENDING
-)
-
-        db.add(payment)
-
-        # Generate payment.id
-        db.flush()
-
-        # ----------------------------------------------------
-        # Create Stripe Checkout Session
-        # ----------------------------------------------------
-
-        try:
-
-            payment_session = (
-                await create_payment_session(
-                    amount=total_amount,
-                    payment=payment,
-                    shipping_address=shipping_address,
-                    user_id=current_user.id,
-                )
-            )
-
-            # ------------------------------------------------
-            # Save Stripe session ID
-            # ------------------------------------------------
-
-            payment.session_id = payment_session.id
-
-            # ------------------------------------------------
-            # Commit payment + Stripe session ID
-            # ------------------------------------------------
-
-            db.commit()
-
-        except Exception:
-
-            db.rollback()
-
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unable to create payment session",
-            )
-
-        # ----------------------------------------------------
-        # Refresh payment
-        # ----------------------------------------------------
-
-        db.refresh(payment)
-
-        # ----------------------------------------------------
-        # Return Stripe URL
-        # ----------------------------------------------------
-
-        return {
-            "payment_method": PaymentMethod.CARD,
-            "order": None,
-            "payment": payment,
-            "payment_url": payment_session.url,
-        }
-
-    # ========================================================
-    # 6. Invalid payment method
-    # ========================================================
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="Invalid payment method",
     )
-    
 # CANCEL ORDER
 # ============================================================
 

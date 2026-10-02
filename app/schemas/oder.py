@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, model_validator
-from app.models.payment import PaymentMethod
+from app.models.payment import PaymentMethod,PaymentStatus
 from app.models.order import OrderStatus
 
 
@@ -38,6 +38,15 @@ class OrderItemResponse(BaseModel):
             }
         return data
 
+class PaymentResponse(BaseModel):
+    id: int
+    amount: Decimal
+    method: PaymentMethod
+    status: PaymentStatus
+    transaction_id: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 class OrderResponse(BaseModel):
     id: int
@@ -47,10 +56,10 @@ class OrderResponse(BaseModel):
     shipping_address: str
     created_at: datetime
     items: list[OrderItemResponse]
-
+    payment: PaymentResponse | None = None
     model_config = ConfigDict(from_attributes=True)
     
 class CheckoutResponse(BaseModel):
     payment_method: PaymentMethod
-    order: OrderResponse | None = None
+    order: OrderResponse
     payment_url: str | None = None

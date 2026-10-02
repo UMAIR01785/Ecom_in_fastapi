@@ -1,18 +1,20 @@
-# app/routers/payment.py
-
 import stripe
 
-from fastapi import APIRouter, Request, HTTPException
-from sqlalchemy.orm import Session ,joinedload
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+)
+from sqlalchemy.orm import Session , joinedload 
 
 from app.config import settings
 from app.database import SessionLocal
-
-from app.models.payment import Payment, PaymentStatus
-from app.models.order import Order, OrderItem, OrderStatus
-from app.models.cart import Cart, CartItem
+from app.models.order import Order, OrderStatus
+from app.models.payment import (
+    Payment,
+    PaymentStatus,
+)
 from app.models.product import Product
-
 from app.websockets.manager import manager
 
 
@@ -23,19 +25,18 @@ router = APIRouter(
 
 
 @router.post("/webhook")
-async def stripe_webhook(request: Request):
-
+async def stripe_webhook(
+    request: Request,
+):
     # ========================================================
-    # 1. Get raw Stripe body
+    # 1. Get raw Stripe request
     # ========================================================
 
     payload = await request.body()
 
-    # ========================================================
-    # 2. Get Stripe signature
-    # ========================================================
-
-    signature = request.headers.get("stripe-signature")
+    signature = request.headers.get(
+        "stripe-signature"
+    )
 
     if not signature:
         raise HTTPException(
@@ -44,7 +45,7 @@ async def stripe_webhook(request: Request):
         )
 
     # ========================================================
-    # 3. Verify Stripe event
+    # 2. Verify Stripe signature
     # ========================================================
 
     try:
@@ -70,7 +71,7 @@ async def stripe_webhook(request: Request):
         )
 
     # ========================================================
-    # 4. Only handle successful checkout
+    # 3. Ignore events we don't handle
     # ========================================================
 
     if event["type"] != "checkout.session.completed":
@@ -80,41 +81,36 @@ async def stripe_webhook(request: Request):
         }
 
     # ========================================================
-    # 5. Get Stripe session
+    # 4. Get Stripe Checkout Session
     # ========================================================
 
     session = event["data"]["object"]
 
     # ========================================================
+    # 5. Make sure Stripe says payment is actually paid
+    # ========================================================
+
+    if session.get("payment_status") != "paid":
+
+        return {
+            "received": True,
+            "message": "Payment is not paid yet",
+        }
+
+    # ========================================================
     # 6. Get metadata
     # ========================================================
 
-    metadata = (
-        session["metadata"]
-        if session.get("metadata")
-        else {}
-    )
+    metadata = session.get("metadata") or {}
 
     payment_id = metadata.get("payment_id")
-    user_id = metadata.get("user_id")
-    shipping_address = metadata.get("shipping_address")
+    order_id = metadata.get("order_id")
 
-    if not payment_id:
+    if not payment_id or not order_id:
+
         raise HTTPException(
             status_code=400,
             detail="Payment metadata missing",
-        )
-
-    if not user_id:
-        raise HTTPException(
-            status_code=400,
-            detail="User ID missing",
-        )
-
-    if not shipping_address:
-        raise HTTPException(
-            status_code=400,
-            detail="Shipping address missing",
         )
 
     db: Session = SessionLocal()
@@ -122,7 +118,7 @@ async def stripe_webhook(request: Request):
     try:
 
         # ====================================================
-        # 7. Find payment
+        # 7. Find Payment and lock it
         # ====================================================
 
         payment = (
@@ -142,7 +138,7 @@ async def stripe_webhook(request: Request):
             )
 
         # ====================================================
-        # 8. Idempotency protection
+        # 8. Idempotency
         # ====================================================
 
         if payment.status == PaymentStatus.PAID:
@@ -153,55 +149,86 @@ async def stripe_webhook(request: Request):
             }
 
         # ====================================================
-        # 9. Get customer's cart
+        # 9. Verify Stripe session belongs to Payment
         # ====================================================
 
-        cart = (
-            db.query(Cart)
-            .options(
-                joinedload(Cart.items)
-                .joinedload(CartItem.product)
-            )
-            .filter(
-                Cart.user_id == int(user_id)
-            )
-            .first()
-        )
-
-        if not cart or not cart.items:
+        if payment.session_id != session["id"]:
 
             raise HTTPException(
                 status_code=400,
-                detail="Cart is empty or no longer exists",
+                detail="Stripe session does not match payment",
             )
 
         # ====================================================
-        # 10. Validate cart again
+        # 10. Verify Payment belongs to this Order
         # ====================================================
 
-        total_amount = payment.amount
+        if payment.order_id != int(order_id):
 
-        order = Order(
-            user_id=int(user_id),
-            total_amount=total_amount,
-            status=OrderStatus.CONFIRMED,
-            shipping_address=shipping_address,
+            raise HTTPException(
+                status_code=400,
+                detail="Payment does not belong to order",
+            )
+
+        # ====================================================
+        # 11. Get existing Order
+        # ====================================================
+
+        order = (
+        db.query(Order)
+        .options(
+            joinedload(Order.items)
+        )
+        .filter(
+            Order.id == int(order_id)
+        )
+        .with_for_update()
+        .first()
+)
+
+        if not order:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Order not found",
+            )
+
+        # ====================================================
+        # 12. Verify amount
+        # ====================================================
+
+        stripe_amount = session.get(
+            "amount_total"
         )
 
-        db.add(order)
+        if stripe_amount is None:
 
-        db.flush()
+            raise HTTPException(
+                status_code=400,
+                detail="Stripe amount missing",
+            )
+
+        expected_amount = int(
+            payment.amount * 100
+        )
+
+        if stripe_amount != expected_amount:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Payment amount mismatch",
+            )
 
         # ====================================================
-        # 11. Create OrderItems
+        # 13. Get OrderItems
         # ====================================================
 
-        for cart_item in cart.items:
+        for order_item in order.items:
 
             product = (
                 db.query(Product)
                 .filter(
-                    Product.id == cart_item.product_id
+                    Product.id == order_item.product_id
                 )
                 .with_for_update()
                 .first()
@@ -218,50 +245,56 @@ async def stripe_webhook(request: Request):
 
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Product '{product.name}' is no longer available",
+                    detail=(
+                        f"Product '{product.name}' "
+                        "is no longer available"
+                    ),
                 )
 
-            if product.stock < cart_item.quantity:
+            if product.stock < order_item.quantity:
 
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Not enough stock for '{product.name}'",
+                    detail=(
+                        f"Not enough stock for "
+                        f"'{product.name}'"
+                    ),
                 )
 
-            order_item = OrderItem(
-                order_id=order.id,
-                product_id=product.id,
-                quantity=cart_item.quantity,
-                unit_price=product.price,
-            )
-
-            db.add(order_item)
-
-            # Reduce stock only after successful payment
-            product.stock -= cart_item.quantity
+            # Reduce stock after successful payment
+            product.stock -= order_item.quantity
 
         # ====================================================
-        # 12. Update payment
+        # 14. Update Payment
         # ====================================================
 
         payment.status = PaymentStatus.PAID
 
-        payment.transaction_id = session.get(
-            "payment_intent"
+        payment.transaction_id = (
+            session.get("payment_intent")
         )
 
-        payment.order_id = order.id
-
         # ====================================================
-        # 13. Clear cart
+        # 15. Update Order
         # ====================================================
 
-        for cart_item in list(cart.items):
-
-            db.delete(cart_item)
+        order.status = OrderStatus.CONFIRMED
 
         # ====================================================
-        # 14. Commit everything together
+        # 16. Clear cart
+        # ====================================================
+
+        # IMPORTANT:
+        # Do not blindly delete the customer's current
+        # cart here. The customer may have changed it
+        # after starting checkout.
+        #
+        # We will handle cart lifecycle separately.
+        #
+        # For now, don't touch the cart here.
+
+        # ====================================================
+        # 17. Commit
         # ====================================================
 
         db.commit()
@@ -269,7 +302,7 @@ async def stripe_webhook(request: Request):
         db.refresh(order)
 
         # ====================================================
-        # 15. Notify admin
+        # 18. Notify admin
         # ====================================================
 
         try:
@@ -285,20 +318,29 @@ async def stripe_webhook(request: Request):
             })
 
         except Exception:
-
-            # WebSocket failure must not
-            # undo successful payment.
+            # Payment is already committed.
+            # WebSocket failure must not rollback it.
             pass
 
         return {
-            "received": True
+            "received": True,
+            "message": "Payment processed successfully",
         }
 
-    except Exception:
+    except HTTPException:
 
         db.rollback()
-
         raise
+
+    except stripe.error.StripeError as e:
+        db.rollback()
+
+        print("STRIPE ERROR:", str(e))
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
 
     finally:
 

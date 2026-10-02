@@ -1,16 +1,8 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import (
-    Column,
-    Integer,
-    Numeric,
-    DateTime,
-    ForeignKey,
-    String,
-    Enum as sqlenum,
-)
-
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Enum as sqlenum
 from sqlalchemy.orm import relationship
 
 from app.database import Base
@@ -31,63 +23,57 @@ class PaymentStatus(str, Enum):
 class Payment(Base):
     __tablename__ = "payments"
 
-    id = Column(
-        Integer,
-        primary_key=True,
-        index=True
-    )
+    id = Column(Integer, primary_key=True, index=True)
 
     order_id = Column(
         Integer,
         ForeignKey("orders.id"),
-        nullable=True,
-        index=True
+        nullable=False,
+        index=True,
     )
 
     amount = Column(
         Numeric(10, 2),
-        nullable=False
+        nullable=False,
     )
 
     method = Column(
         sqlenum(PaymentMethod),
-        nullable=False
+        nullable=False,
     )
 
     status = Column(
         sqlenum(PaymentStatus),
         nullable=False,
-        default=PaymentStatus.PENDING
+        default=PaymentStatus.PENDING,
     )
 
-    # Payment gateway session ID
     session_id = Column(
         String(255),
         nullable=True,
-        index=True
+        index=True,
     )
 
-    # Actual transaction ID after successful payment
     transaction_id = Column(
         String(255),
         nullable=True,
-        unique=True
+        unique=True,
     )
 
     created_at = Column(
         DateTime,
         default=datetime.utcnow,
-        nullable=False
+        nullable=False,
     )
 
     updated_at = Column(
         DateTime,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
-        nullable=False
+        nullable=False,
     )
 
     order = relationship(
         "Order",
-        back_populates="payment"
+        back_populates="payment",
     )

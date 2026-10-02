@@ -1,25 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
-from app.models.order import Order, OrderItem
-from app.models.user import User
-from app.websockets.manager import manager
 from app.database import get_db
 from app.dependencies.auth import get_current_user
-
-from app.schemas.oder import CheckoutRequest, OrderResponse,CheckoutResponse
-from app.services.oder_servies import checkout_cart ,cancel_order
+from app.models.order import Order, OrderItem
+from app.models.user import User
+from app.schemas.oder import (
+    CheckoutRequest,
+    CheckoutResponse,
+    OrderResponse,
+)
+from app.services.oder_servies import (
+    checkout_cart,
+    cancel_order,
+)
 
 
 router = APIRouter(
     prefix="/orders",
     tags=["Orders"],
 )
-
-
-# ============================================
-# CHECKOUT
-# ============================================
 
 
 @router.post(
@@ -32,45 +32,13 @@ async def checkout(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # --------------------------------------------------------
-    # 1. Process checkout
-    # --------------------------------------------------------
-
-    checkout_result = await checkout_cart(
+    return await checkout_cart(
         db=db,
         current_user=current_user,
         shipping_address=checkout_data.shipping_address,
         payment_method=checkout_data.payment_method,
     )
 
-    # --------------------------------------------------------
-    # 2. Get Order from checkout result
-    # --------------------------------------------------------
-
-    order = checkout_result.get("order")
-
-    # --------------------------------------------------------
-    # 3. Notify admin only if an Order was actually created
-    # --------------------------------------------------------
-
-    if order:
-        await manager.send_to_admin({
-            "type": "new_order",
-            "order_id": order.id,
-            "user_id": order.user_id,
-            "total_amount": str(order.total_amount),
-            "status": order.status.value,
-        })
-
-    # --------------------------------------------------------
-    # 4. Return checkout response to frontend
-    # --------------------------------------------------------
-
-    return checkout_result
-
-# ============================================
-# GET MY ORDERS
-# ============================================
 
 @router.get(
     "/",
@@ -83,9 +51,12 @@ def get_my_orders(
     orders = (
         db.query(Order)
         .options(
-            joinedload(Order.items).joinedload(OrderItem.product)
+            joinedload(Order.items)
+            .joinedload(OrderItem.product)
         )
-        .filter(Order.user_id == current_user.id)
+        .filter(
+            Order.user_id == current_user.id
+        )
         .order_by(Order.created_at.desc())
         .all()
     )
@@ -105,7 +76,8 @@ def get_order(
     order = (
         db.query(Order)
         .options(
-            joinedload(Order.items).joinedload(OrderItem.product)
+            joinedload(Order.items)
+            .joinedload(OrderItem.product)
         )
         .filter(
             Order.id == order_id,
