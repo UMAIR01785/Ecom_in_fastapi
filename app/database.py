@@ -8,7 +8,11 @@ load_dotenv()
 
 
 
-engine = create_engine(settings.database_url)
+engine = create_engine(settings.database_url,
+                        pool_pre_ping=True,
+    pool_size=5,
+    max_overflow=10,
+    pool_timeout=30,)
 
 SessionLocal = sessionmaker(
     autocommit=False,

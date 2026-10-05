@@ -3,13 +3,16 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
 from app.dependencies.auth import get_current_user
+
 from app.models.order import Order, OrderItem
 from app.models.user import User
+
 from app.schemas.oder import (
     CheckoutRequest,
     CheckoutResponse,
     OrderResponse,
 )
+
 from app.services.oder_servies import (
     checkout_cart,
     cancel_order,
@@ -20,6 +23,11 @@ router = APIRouter(
     prefix="/orders",
     tags=["Orders"],
 )
+
+
+# ============================================================
+# CHECKOUT
+# ============================================================
 
 
 @router.post(
@@ -35,9 +43,13 @@ async def checkout(
     return await checkout_cart(
         db=db,
         current_user=current_user,
-        shipping_address=checkout_data.shipping_address,
-        payment_method=checkout_data.payment_method,
+        checkout_data=checkout_data,
     )
+
+
+# ============================================================
+# GET MY ORDERS
+# ============================================================
 
 
 @router.get(
@@ -49,23 +61,33 @@ def get_my_orders(
     current_user: User = Depends(get_current_user),
 ):
     orders = (
-    db.query(Order)
-    .options(
-        joinedload(Order.items)
-        .joinedload(OrderItem.product),
+        db.query(Order)
+        .options(
+            # Order items + product
+            joinedload(Order.items)
+            .joinedload(OrderItem.product),
 
-        joinedload(Order.payment),
+            # Payment
+            joinedload(Order.payment),
+
+            # Shipping address
+            joinedload(Order.shipping_address),
+        )
+        .filter(
+            Order.user_id == current_user.id
+        )
+        .order_by(
+            Order.created_at.desc()
+        )
+        .all()
     )
-    .filter(
-        Order.user_id == current_user.id
-    )
-    .order_by(
-        Order.created_at.desc()
-    )
-    .all()
-)
 
     return orders
+
+
+# ============================================================
+# GET SINGLE ORDER
+# ============================================================
 
 
 @router.get(
@@ -78,19 +100,24 @@ def get_order(
     current_user: User = Depends(get_current_user),
 ):
     order = (
-    db.query(Order)
-    .options(
-        joinedload(Order.items)
-        .joinedload(OrderItem.product),
+        db.query(Order)
+        .options(
+            # Order items + product
+            joinedload(Order.items)
+            .joinedload(OrderItem.product),
 
-        joinedload(Order.payment),
+            # Payment
+            joinedload(Order.payment),
+
+            # Shipping address
+            joinedload(Order.shipping_address),
+        )
+        .filter(
+            Order.id == order_id,
+            Order.user_id == current_user.id,
+        )
+        .first()
     )
-    .filter(
-        Order.id == order_id,
-        Order.user_id == current_user.id,
-    )
-    .first()
-)
 
     if not order:
         raise HTTPException(
@@ -99,6 +126,11 @@ def get_order(
         )
 
     return order
+
+
+# ============================================================
+# CANCEL MY ORDER
+# ============================================================
 
 
 @router.patch(

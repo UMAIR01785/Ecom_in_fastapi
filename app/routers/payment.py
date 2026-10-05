@@ -1,22 +1,42 @@
 import stripe
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+)
+
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
-from app.database import SessionLocal
-from app.dependencies.auth import get_current_user
-from app.models.order import Order, OrderStatus
-from app.models.order import OrderItem
-from app.models.payment import Payment, PaymentStatus
+from app.database import SessionLocal, get_db
+
+from app.models.order import (
+    Order,
+    OrderStatus,
+    OrderItem,
+)
+
+from app.models.payment import (
+    Payment,
+    PaymentStatus,
+)
+
 from app.models.product import Product
 from app.models.user import User
+
 from app.schemas.payment import (
-    PaymentReceiptItem,
     PaymentReceiptResponse,
+    PaymentReceiptItem,
 )
-from app.services.payment_service import get_stripe_receipt_url
-from app.websockets import manager
+
+from app.websockets.manager import manager
+
+# IMPORTANT:
+# Use the actual location of get_current_user
+# from your project.
+from app.dependencies.auth import get_current_user
 
 
 router = APIRouter(
@@ -30,7 +50,13 @@ router = APIRouter(
 # ============================================================
 
 @router.post("/webhook")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(
+    request: Request,
+):
+
+    # ========================================================
+    # 1. Get raw Stripe request
+    # ========================================================
 
     payload = await request.body()
 
@@ -40,11 +66,16 @@ async def stripe_webhook(request: Request):
 
     if not signature:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail="Missing Stripe signature",
         )
 
+    # ========================================================
+    # 2. Verify Stripe webhook signature
+    # ========================================================
+
     try:
+
         event = stripe.Webhook.construct_event(
             payload,
             signature,
@@ -52,218 +83,349 @@ async def stripe_webhook(request: Request):
         )
 
     except ValueError:
+
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail="Invalid payload",
         )
 
     except stripe.error.SignatureVerificationError:
+
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=400,
             detail="Invalid Stripe signature",
         )
 
-    # --------------------------------------------------------
-    # Only process completed checkout sessions
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. Only process checkout.session.completed
+    # ========================================================
 
     if event["type"] != "checkout.session.completed":
+
         return {
             "received": True,
             "message": "Event ignored",
         }
 
-    session = event["data"]["object"]
+    # ========================================================
+    # 4. Get Stripe Checkout Session
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Make sure Stripe says payment is actually paid
-    # --------------------------------------------------------
+    # Stripe returns a StripeObject, not a normal dict.
+    # Convert it so .get() works.
+    session = event["data"]["object"].to_dict()
+
+    # ========================================================
+    # 5. Check Stripe payment status
+    # ========================================================
 
     if session.get("payment_status") != "paid":
+
         return {
             "received": True,
-            "message": "Payment is not marked as paid",
+            "message": "Payment is not paid yet",
         }
+
+    # ========================================================
+    # 6. Get metadata
+    # ========================================================
 
     metadata = session.get("metadata") or {}
 
-    payment_id = metadata.get("payment_id")
-    order_id = metadata.get("order_id")
+    payment_id = metadata.get(
+        "payment_id"
+    )
+
+    order_id = metadata.get(
+        "order_id"
+    )
 
     if not payment_id or not order_id:
+
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing payment or order metadata",
+            status_code=400,
+            detail="Payment metadata missing",
         )
+
+    # ========================================================
+    # 7. Create database session
+    # ========================================================
 
     db: Session = SessionLocal()
 
     try:
 
-        # ----------------------------------------------------
-        # Lock payment row
-        # ----------------------------------------------------
+        # ====================================================
+        # 8. Find payment and lock it
+        # ====================================================
 
         payment = (
             db.query(Payment)
-            .filter(Payment.id == int(payment_id))
+            .filter(
+                Payment.id == int(payment_id)
+            )
             .with_for_update()
             .first()
         )
 
         if not payment:
+
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Payment not found",
             )
 
-        # ----------------------------------------------------
-        # Idempotency
-        # ----------------------------------------------------
+        # ====================================================
+        # 9. Idempotency check
+        # ====================================================
 
         if payment.status == PaymentStatus.PAID:
+
             return {
                 "received": True,
                 "message": "Payment already processed",
             }
 
-        # ----------------------------------------------------
-        # Verify Stripe session
-        # ----------------------------------------------------
+        # ====================================================
+        # 10. Verify Stripe session
+        # ====================================================
 
-        if payment.session_id != session.get("id"):
+        if payment.session_id != session["id"]:
+
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Stripe session does not match payment",
+                status_code=400,
+                detail=(
+                    "Stripe session does not "
+                    "match payment"
+                ),
             )
 
-        # ----------------------------------------------------
-        # Verify order
-        # ----------------------------------------------------
+        # ====================================================
+        # 11. Verify payment belongs to order
+        # ====================================================
+
+        if payment.order_id != int(order_id):
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Payment does not belong "
+                    "to order"
+                ),
+            )
+
+        # ====================================================
+        # 12. Get and lock order
+        #
+        # Do NOT use joinedload(Order.items)
+        # with with_for_update().
+        # ====================================================
 
         order = (
             db.query(Order)
-            .options(
-                joinedload(Order.items)
-                .joinedload(OrderItem.product)
+            .filter(
+                Order.id == int(order_id)
             )
-            .filter(Order.id == int(order_id))
             .with_for_update()
             .first()
         )
 
         if not order:
+
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Order not found",
             )
 
-        if payment.order_id != order.id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Payment does not belong to this order",
+        # ====================================================
+        # 13. Get order items separately
+        # ====================================================
+
+        order_items = (
+            db.query(OrderItem)
+            .filter(
+                OrderItem.order_id == order.id
             )
+            .all()
+        )
 
-        # ----------------------------------------------------
-        # Verify Stripe amount
-        # ----------------------------------------------------
+        # ====================================================
+        # 14. Verify amount
+        # ====================================================
 
-        stripe_amount = session.get("amount_total")
+        stripe_amount = session.get(
+            "amount_total"
+        )
 
         expected_amount = int(
             payment.amount * 100
         )
 
         if stripe_amount != expected_amount:
+
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="Payment amount mismatch",
             )
 
-        # ----------------------------------------------------
-        # Reserve/decrease stock
-        # ----------------------------------------------------
+        # ====================================================
+        # 15. Update product stock
+        # ====================================================
 
-        for item in order.items:
+        for order_item in order_items:
 
             product = (
                 db.query(Product)
-                .filter(Product.id == item.product_id)
+                .filter(
+                    Product.id ==
+                    order_item.product_id
+                )
                 .with_for_update()
                 .first()
             )
 
             if not product:
+
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Product {item.product_id} not found",
+                    status_code=400,
+                    detail="Product no longer exists",
                 )
 
             if not product.is_active:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Product {product.name} is inactive",
-                )
 
-            if product.stock < item.quantity:
                 raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
+                    status_code=400,
                     detail=(
-                        f"Insufficient stock for "
-                        f"{product.name}"
+                        f"Product '{product.name}' "
+                        "is no longer available"
                     ),
                 )
 
-            product.stock -= item.quantity
+            if product.stock < order_item.quantity:
 
-        # ----------------------------------------------------
-        # Update payment
-        # ----------------------------------------------------
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Not enough stock for "
+                        f"'{product.name}'"
+                    ),
+                )
+
+            product.stock -= (
+                order_item.quantity
+            )
+
+        # ====================================================
+        # 16. Update payment
+        # ====================================================
 
         payment.status = PaymentStatus.PAID
 
-        payment.transaction_id = session.get(
-            "payment_intent"
+        payment.transaction_id = (
+            session.get("payment_intent")
         )
 
-        # ----------------------------------------------------
-        # Update order
-        # ----------------------------------------------------
+        # ====================================================
+        # 17. Update order
+        # ====================================================
 
         order.status = OrderStatus.CONFIRMED
 
+        # ====================================================
+        # 18. Commit everything
+        # ====================================================
+
         db.commit()
 
-        # ----------------------------------------------------
-        # Notify admin through websocket
-        # ----------------------------------------------------
+        # ====================================================
+        # 19. Notify admin
+        # ====================================================
 
-        await manager.send_to_admin(
-            {
+        try:
+
+            await manager.send_to_admin({
+
                 "type": "payment_completed",
-                "payment_id": payment.id,
-                "order_id": order.id,
-                "user_id": order.user_id,
-                "amount": str(payment.amount),
-                "status": payment.status.value,
-                "transaction_id": payment.transaction_id,
-            }
-        )
+
+                "payment_id":
+                    payment.id,
+
+                "order_id":
+                    order.id,
+
+                "user_id":
+                    order.user_id,
+
+                "amount":
+                    str(payment.amount),
+
+                "status":
+                    payment.status.value,
+
+                "transaction_id":
+                    payment.transaction_id,
+            })
+
+        except Exception:
+
+            # Payment is already committed.
+            # WebSocket failure must not
+            # rollback the payment.
+
+            pass
 
         return {
             "received": True,
-            "message": "Payment processed successfully",
+            "message": (
+                "Payment processed successfully"
+            ),
         }
 
+    # ========================================================
+    # HTTP exception
+    # ========================================================
+
     except HTTPException:
+
         db.rollback()
+
         raise
 
-    except Exception:
+    # ========================================================
+    # Stripe exception
+    # ========================================================
+
+    except stripe.error.StripeError as e:
+
         db.rollback()
-        raise
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(e),
+        )
+
+    # ========================================================
+    # Any other error
+    # ========================================================
+
+    except Exception as e:
+
+        db.rollback()
+
+        print(
+            "WEBHOOK ERROR:",
+            repr(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Webhook error: {str(e)}"
+            ),
+        )
 
     finally:
+
         db.close()
 
 
@@ -277,105 +439,159 @@ async def stripe_webhook(request: Request):
 )
 def get_payment_receipt(
     payment_id: int,
+    db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(
-        lambda: SessionLocal()
-    ),
 ):
+
+    # ========================================================
+    # 1. Find payment
+    #
+    # Load:
+    # Payment
+    #   └── Order
+    #       ├── User
+    #       └── OrderItems
+    #           └── Product
+    # ========================================================
 
     payment = (
         db.query(Payment)
         .options(
             joinedload(Payment.order)
-            .joinedload(Order.user),
-
-            joinedload(Payment.order)
             .joinedload(Order.items)
             .joinedload(OrderItem.product),
+
+            joinedload(Payment.order)
+            .joinedload(Order.user),
         )
-        .filter(Payment.id == payment_id)
+        .filter(
+            Payment.id == payment_id
+        )
         .first()
     )
 
+    # ========================================================
+    # 2. Payment not found
+    # ========================================================
+
     if not payment:
+
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=404,
             detail="Payment not found",
         )
 
-    # --------------------------------------------------------
-    # Security:
-    # Customer can only see their own payment
-    # --------------------------------------------------------
-
-    if payment.order.user_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You cannot access this payment",
-        )
+    # ========================================================
+    # 3. Get order
+    # ========================================================
 
     order = payment.order
-    user = order.user
+
+    if not order:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found",
+        )
+
+    # ========================================================
+    # 4. Security check
+    #
+    # Customer can only see their own receipt.
+    # ========================================================
+
+    if order.user_id != current_user.id:
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You are not allowed to "
+                "view this payment receipt"
+            ),
+        )
+
+    # ========================================================
+    # 5. Build receipt items
+    # ========================================================
 
     receipt_items = []
 
-    for item in order.items:
-
-        subtotal = (
-            item.unit_price * item.quantity
-        )
+    for order_item in order.items:
 
         receipt_items.append(
             PaymentReceiptItem(
-                product_id=item.product_id,
-                product_name=item.product.name,
-                quantity=item.quantity,
-                unit_price=item.unit_price,
-                subtotal=subtotal,
+
+                product_id=
+                    order_item.product_id,
+
+                product_name=
+                    order_item.product.name,
+
+                quantity=
+                    order_item.quantity,
+
+                unit_price=
+                    order_item.unit_price,
+
+                subtotal=(
+                    order_item.unit_price
+                    * order_item.quantity
+                ),
             )
         )
 
-    receipt_url = None
-
-    if payment.status == PaymentStatus.PAID:
-        receipt_url = get_stripe_receipt_url(
-            payment.transaction_id
-        )
+    # ========================================================
+    # 6. Return receipt
+    # ========================================================
 
     return PaymentReceiptResponse(
-        payment_id=payment.id,
 
-        payment_status=payment.status,
-        payment_method=payment.method,
+        payment_id=
+            payment.id,
 
-        amount=payment.amount,
+        payment_status=
+            payment.status,
 
-        transaction_id=payment.transaction_id,
-        session_id=payment.session_id,
+        payment_method=
+            payment.method,
 
-        order_id=order.id,
-        order_status=order.status,
+        amount=
+            payment.amount,
 
-        user_id=user.id,
+        transaction_id=
+            payment.transaction_id,
+
+        session_id=
+            payment.session_id,
+
+        order_id=
+            order.id,
+
+        order_status=
+            order.status,
+
+        user_id=
+            order.user_id,
 
         customer_name=(
-            f"{user.first_name} "
-            f"{user.last_name}"
+            f"{order.user.first_name} "
+            f"{order.user.last_name}"
         ),
 
-        customer_email=user.email,
+        customer_email=
+            order.user.email,
 
-        shipping_address=order.shipping_address,
+        shipping_address=
+            order.shipping_address,
 
-        items=receipt_items,
+        items=
+            receipt_items,
 
-        paid_at=(
-            payment.updated_at
-            if payment.status == PaymentStatus.PAID
-            else None
-        ),
+        paid_at=
+            payment.paid_at,
 
-        created_at=payment.created_at,
+        created_at=
+            payment.created_at,
 
-        receipt_url=receipt_url,
+        receipt_url=None,
     )

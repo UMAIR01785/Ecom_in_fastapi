@@ -1,18 +1,42 @@
-from fastapi import APIRouter, Depends, status,HTTPException
-from sqlalchemy.orm import Session, joinedload
-from app.websockets.manager import manager
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
+
+from sqlalchemy.orm import (
+    Session,
+    joinedload,
+)
+
 from app.schemas.admin_order import OrderStatusUpdate
+
 from app.database import get_db
-from app.models.order import Order, OrderItem
+
+from app.models.order import (
+    Order,
+    OrderItem,
+)
+
 from app.models.user import User
+
 from app.dependencies.permissions import admin_required
-from app.services.oder_servies import update_order_status
+
+from app.services.oder_servies import (
+    update_order_status,
+)
 
 
 router = APIRouter(
     prefix="/admin/orders",
-    tags=["Admin Orders"]
+    tags=["Admin Orders"],
 )
+
+
+# ============================================================
+# GET ALL ORDERS
+# ============================================================
 
 
 @router.get("/")
@@ -23,18 +47,36 @@ def get_all_orders(
     orders = (
         db.query(Order)
         .options(
+            # Customer
             joinedload(Order.user),
+
+            # Order items + product
             joinedload(Order.items)
-            .joinedload(OrderItem.product)
+            .joinedload(OrderItem.product),
+
+            # Order shipping address
+            joinedload(Order.shipping_address),
+
+            # Payment
+            joinedload(Order.payment),
         )
-        .order_by(Order.created_at.desc())
+        .order_by(
+            Order.created_at.desc()
+        )
         .all()
     )
 
     return orders
 
 
-@router.patch("/{order_id}/status")
+# ============================================================
+# UPDATE ORDER STATUS
+# ============================================================
+
+
+@router.patch(
+    "/{order_id}/status"
+)
 async def update_order_status_admin(
     order_id: int,
     data: OrderStatusUpdate,
@@ -48,7 +90,14 @@ async def update_order_status_admin(
     )
 
 
-@router.get("/{order_id}")
+# ============================================================
+# GET SINGLE ORDER DETAIL
+# ============================================================
+
+
+@router.get(
+    "/{order_id}"
+)
 def get_order_detail(
     order_id: int,
     db: Session = Depends(get_db),
@@ -57,18 +106,29 @@ def get_order_detail(
     order = (
         db.query(Order)
         .options(
+            # Customer
             joinedload(Order.user),
+
+            # Order items + product
             joinedload(Order.items)
-            .joinedload(OrderItem.product)
+            .joinedload(OrderItem.product),
+
+            # Order shipping address
+            joinedload(Order.shipping_address),
+
+            # Payment
+            joinedload(Order.payment),
         )
-        .filter(Order.id == order_id)
+        .filter(
+            Order.id == order_id
+        )
         .first()
     )
 
     if not order:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found"
+            detail="Order not found",
         )
 
     return order

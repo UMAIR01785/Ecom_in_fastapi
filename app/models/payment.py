@@ -59,6 +59,10 @@ class Payment(Base):
         nullable=True,
         unique=True,
     )
+    paid_at = Column(
+    DateTime,
+    nullable=True,
+)
 
     created_at = Column(
         DateTime,

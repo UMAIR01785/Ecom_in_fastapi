@@ -1,18 +1,23 @@
-
 from decimal import Decimal
+
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session, joinedload
+
+from app.websockets.manager import manager
+
+from app.models.cart import Cart, CartItem
+from app.models.order import Order, OrderItem, OrderStatus
+from app.models.order_address import OrderAddress
 from app.models.payment import (
     Payment,
     PaymentMethod,
     PaymentStatus,
 )
-
-from fastapi import HTTPException, status
-from sqlalchemy.orm import Session, joinedload
-from app.websockets.manager import manager
-from app.models.cart import Cart, CartItem
-from app.models.order import Order, OrderItem, OrderStatus
 from app.models.product import Product
 from app.models.user import User
+
+from app.schemas.oder import CheckoutRequest
+
 from app.services.payment_service import create_payment_session
 
 
@@ -24,8 +29,7 @@ from app.services.payment_service import create_payment_session
 async def checkout_cart(
     db: Session,
     current_user: User,
-    shipping_address: str,
-    payment_method: PaymentMethod,
+    checkout_data: CheckoutRequest,
 ):
     # ========================================================
     # 1. Get cart
@@ -56,7 +60,14 @@ async def checkout_cart(
         )
 
     # ========================================================
-    # 2. Validate products and calculate total
+    # 2. Get checkout address and payment method
+    # ========================================================
+
+    address = checkout_data.order_address
+    payment_method = checkout_data.payment_method
+
+    # ========================================================
+    # 3. Validate products and calculate total
     # ========================================================
 
     total_amount = Decimal("0.00")
@@ -67,7 +78,9 @@ async def checkout_cart(
 
         product = (
             db.query(Product)
-            .filter(Product.id == cart_item.product_id)
+            .filter(
+                Product.id == cart_item.product_id
+            )
             .with_for_update()
             .first()
         )
@@ -103,14 +116,13 @@ async def checkout_cart(
         )
 
     # ========================================================
-    # 3. Create Order
+    # 4. Create Order
     # ========================================================
 
     order = Order(
         user_id=current_user.id,
         total_amount=total_amount,
         status=OrderStatus.PENDING,
-        shipping_address=shipping_address,
     )
 
     db.add(order)
@@ -119,7 +131,31 @@ async def checkout_cart(
     db.flush()
 
     # ========================================================
-    # 4. Create OrderItems
+    # 5. Create OrderAddress
+    # ========================================================
+
+    order_address = OrderAddress(
+        order_id=order.id,
+
+        full_name=address.full_name,
+        phone_number=address.phone_number,
+
+        address_line1=address.address_line1,
+        address_line2=address.address_line2,
+
+        city=address.city,
+        state=address.state,
+
+        postal_code=address.postal_code,
+
+        country=address.country,
+        landmark=address.landmark,
+    )
+
+    db.add(order_address)
+
+    # ========================================================
+    # 6. Create OrderItems
     # ========================================================
 
     for cart_item in cart.items:
@@ -138,7 +174,7 @@ async def checkout_cart(
         db.add(order_item)
 
     # ========================================================
-    # 5. Create Payment
+    # 7. Create Payment
     # ========================================================
 
     payment = Payment(
@@ -154,28 +190,39 @@ async def checkout_cart(
     db.flush()
 
     # ========================================================
-    # 6. CARD
+    # 8. CARD PAYMENT
     # ========================================================
 
     if payment_method == PaymentMethod.CARD:
-        
+
         if total_amount < Decimal("140.00"):
             raise HTTPException(
                 status_code=400,
-                detail="Card payment requires a higher order amount."
+                detail=(
+                    "Card payment requires "
+                    "a higher order amount."
+                ),
             )
 
         try:
 
-            payment_session = await create_payment_session(
-                order=order,
-                payment=payment,
+            payment_session = (
+                await create_payment_session(
+                    order=order,
+                    payment=payment,
+                )
             )
 
-            payment.session_id = payment_session.id
+            payment.session_id = (
+                payment_session.id
+            )
 
-            # We can commit the Order + Payment +
-            # Stripe session ID together.
+            # Commit:
+            # Order
+            # OrderAddress
+            # OrderItems
+            # Payment
+            # Stripe session ID
             db.commit()
 
         except Exception:
@@ -190,7 +237,8 @@ async def checkout_cart(
         db.refresh(order)
         db.refresh(payment)
 
-        # Clear cart after checkout snapshot has been created.
+        # Clear cart after checkout snapshot
+        # has been successfully created.
         for cart_item in list(cart.items):
             db.delete(cart_item)
 
@@ -205,17 +253,16 @@ async def checkout_cart(
         }
 
     # ========================================================
-    # 7. COD
+    # 9. COD PAYMENT
     # ========================================================
 
     if payment_method == PaymentMethod.COD:
-        
 
         # For COD, order is accepted immediately.
-        # Payment remains pending because customer
+        # Payment remains PENDING because the customer
         # pays when receiving the order.
 
-        order.status = OrderStatus.CONFIRMED
+        order.status = OrderStatus.PENDING
 
         # Reserve/decrease stock now.
         for cart_item in cart.items:
@@ -245,15 +292,20 @@ async def checkout_cart(
 
         try:
 
-            await manager.send_to_admin({
-                "type": "new_order",
-                "order_id": order.id,
-                "user_id": order.user_id,
-                "total_amount": str(order.total_amount),
-                "status": order.status.value,
-            })
+            await manager.send_to_admin(
+                {
+                    "type": "new_order",
+                    "order_id": order.id,
+                    "user_id": order.user_id,
+                    "total_amount": str(
+                        order.total_amount
+                    ),
+                    "status": order.status.value,
+                }
+            )
 
         except Exception:
+
             # WebSocket failure must not
             # undo the database transaction.
             pass
@@ -264,12 +316,20 @@ async def checkout_cart(
             "payment_url": None,
         }
 
+    # ========================================================
+    # Invalid payment method
+    # ========================================================
+
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="Invalid payment method",
     )
+
+
+# ============================================================
 # CANCEL ORDER
 # ============================================================
+
 
 async def cancel_order(
     db: Session,
@@ -315,7 +375,9 @@ async def cancel_order(
 
         product = (
             db.query(Product)
-            .filter(Product.id == order_item.product_id)
+            .filter(
+                Product.id == order_item.product_id
+            )
             .with_for_update()
             .first()
         )
@@ -336,7 +398,6 @@ async def cancel_order(
     try:
 
         db.commit()
-      
 
     except Exception:
 
@@ -352,21 +413,30 @@ async def cancel_order(
     # ========================================================
 
     db.refresh(order)
-    
+
     try:
-        await manager.send_to_admin({
-        "type": "order_cancelled",
-        "order_id": order.id,
-        "user_id": order.user_id,
-        "status": order.status.value,
-    })
+
+        await manager.send_to_admin(
+            {
+                "type": "order_cancelled",
+                "order_id": order.id,
+                "user_id": order.user_id,
+                "status": order.status.value,
+            }
+        )
+
     except Exception:
-    # Do not rollback here because the DB transaction
-    # has already been committed.
+
+        # Do not rollback here because the DB transaction
+        # has already been committed.
         pass
 
     return order
 
+
+# ============================================================
+# ORDER STATUS TRANSITIONS
+# ============================================================
 
 
 ALLOWED_TRANSITIONS = {
@@ -388,15 +458,26 @@ ALLOWED_TRANSITIONS = {
 }
 
 
+# ============================================================
+# UPDATE ORDER STATUS
+# ============================================================
+
+
 async def update_order_status(
     db: Session,
     order_id: int,
     new_status: OrderStatus,
 ):
+
+    # ========================================================
     # 1. Get and lock the order
+    # ========================================================
+
     order = (
         db.query(Order)
-        .filter(Order.id == order_id)
+        .filter(
+            Order.id == order_id
+        )
         .with_for_update()
         .first()
     )
@@ -407,10 +488,18 @@ async def update_order_status(
             detail="Order not found",
         )
 
+    # ========================================================
     # 2. Get allowed next statuses
-    allowed_statuses = ALLOWED_TRANSITIONS[order.status]
+    # ========================================================
 
+    allowed_statuses = (
+        ALLOWED_TRANSITIONS[order.status]
+    )
+
+    # ========================================================
     # 3. Check whether transition is valid
+    # ========================================================
+
     if new_status not in allowed_statuses:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -421,14 +510,22 @@ async def update_order_status(
             ),
         )
 
+    # ========================================================
     # 4. Change status
+    # ========================================================
+
     order.status = new_status
 
+    # ========================================================
     # 5. Save transaction
+    # ========================================================
+
     try:
+
         db.commit()
 
     except Exception:
+
         db.rollback()
 
         raise HTTPException(
@@ -436,11 +533,15 @@ async def update_order_status(
             detail="Failed to update order status",
         )
 
+    # ========================================================
     # 6. Reload updated order
+    # ========================================================
+
     db.refresh(order)
-     # --------------------------------------------------------
+
+    # ========================================================
     # 7. Send real-time WebSocket event
-    # --------------------------------------------------------
+    # ========================================================
 
     await manager.send_to_user(
         order.user_id,
