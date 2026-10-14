@@ -2,7 +2,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, joinedload
-
+from app.services.inventory_service import publish_inventory_updates
 from app.websockets.manager import manager
 
 from app.models.cart import Cart, CartItem
@@ -110,7 +110,9 @@ async def checkout_cart(
                 "Card payment requires a higher order amount.",
             )
 
+        
         now = datetime.utcnow()
+
         reservation_expiry = (
             now + timedelta(minutes=CARD_RESERVATION_MINUTES)
             if checkout_data.payment_method == PaymentMethod.CARD
@@ -122,10 +124,13 @@ async def checkout_cart(
             total_amount=total_amount,
             status=OrderStatus.PENDING,
             reservation_expires_at=reservation_expiry,
+            inventory_deducted_at=now,
             inventory_released_at=None,
         )
+
         db.add(order)
         db.flush()
+
 
         address = checkout_data.order_address
         db.add(
