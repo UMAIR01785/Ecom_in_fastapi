@@ -10,6 +10,7 @@ from app.routers import admin_payment
 from app.routers.order import router as order_router
 from app.routers.admin_oder import router as admin_router
 from app.routers import payment
+from app.routers.admin_reporting import router as admin_reporting_router
 from app.routers.admin_chat import router as admin_chat_router
 app = FastAPI(
     title="E-Commerce API",
@@ -17,7 +18,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-
+app.include_router(admin_reporting_router)
 app.include_router(websocket_router)
 app.include_router(admin_payment.router)
 app.include_router(auth_router)
