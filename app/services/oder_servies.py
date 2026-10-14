@@ -1,5 +1,5 @@
 from decimal import Decimal
-
+from datetime import datetime, timedelta
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session, joinedload
 
@@ -21,6 +21,7 @@ from app.schemas.oder import CheckoutRequest
 from app.services.payment_service import create_payment_session
 
 
+CARD_RESERVATION_MINUTES = 30
 # ============================================================
 # CHECKOUT
 # ============================================================
@@ -31,301 +32,238 @@ async def checkout_cart(
     current_user: User,
     checkout_data: CheckoutRequest,
 ):
-    # ========================================================
-    # 1. Get cart
-    # ========================================================
-
-    cart = (
-        db.query(Cart)
-        .options(
-            joinedload(Cart.items)
-            .joinedload(CartItem.product)
-        )
-        .filter(
-            Cart.user_id == current_user.id
-        )
-        .first()
-    )
-
-    if not cart:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Cart not found",
-        )
-
-    if not cart.items:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cart is empty",
-        )
-
-    # ========================================================
-    # 2. Get checkout address and payment method
-    # ========================================================
-
-    address = checkout_data.order_address
-    payment_method = checkout_data.payment_method
-
-    # ========================================================
-    # 3. Validate products and calculate total
-    # ========================================================
-
-    total_amount = Decimal("0.00")
-
-    locked_products = {}
-
-    for cart_item in cart.items:
-
-        product = (
-            db.query(Product)
-            .filter(
-                Product.id == cart_item.product_id
-            )
+    try:
+        # Lock the cart first to prevent two simultaneous
+        # checkouts from consuming the same cart.
+        cart = (
+            db.query(Cart)
+            .filter(Cart.user_id == current_user.id)
             .with_for_update()
             .first()
         )
 
-        if not product:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Product no longer exists",
-            )
+        if not cart:
+            raise HTTPException(404, "Cart not found")
 
-        if not product.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Product '{product.name}' "
-                    "is no longer available"
-                ),
-            )
-
-        if product.stock < cart_item.quantity:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    f"Not enough stock for "
-                    f"'{product.name}'"
-                ),
-            )
-
-        locked_products[product.id] = product
-
-        total_amount += (
-            product.price * cart_item.quantity
+        cart_items = (
+            db.query(CartItem)
+            .filter(CartItem.cart_id == cart.id)
+            .order_by(CartItem.product_id)
+            .all()
         )
 
-    # ========================================================
-    # 4. Create Order
-    # ========================================================
+        if not cart_items:
+            raise HTTPException(400, "Cart is empty")
 
-    order = Order(
-        user_id=current_user.id,
-        total_amount=total_amount,
-        status=OrderStatus.PENDING,
-    )
+        if checkout_data.payment_method not in (
+            PaymentMethod.CARD,
+            PaymentMethod.COD,
+        ):
+            raise HTTPException(400, "Invalid payment method")
 
-    db.add(order)
+        # Lock products in a consistent order to reduce
+        # deadlocks when multiple products are purchased.
+        product_ids = sorted({
+            item.product_id for item in cart_items
+        })
 
-    # Get generated order.id
-    db.flush()
-
-    # ========================================================
-    # 5. Create OrderAddress
-    # ========================================================
-
-    order_address = OrderAddress(
-        order_id=order.id,
-
-        full_name=address.full_name,
-        phone_number=address.phone_number,
-
-        address_line1=address.address_line1,
-        address_line2=address.address_line2,
-
-        city=address.city,
-        state=address.state,
-
-        postal_code=address.postal_code,
-
-        country=address.country,
-        landmark=address.landmark,
-    )
-
-    db.add(order_address)
-
-    # ========================================================
-    # 6. Create OrderItems
-    # ========================================================
-
-    for cart_item in cart.items:
-
-        product = locked_products[
-            cart_item.product_id
-        ]
-
-        order_item = OrderItem(
-            order_id=order.id,
-            product_id=product.id,
-            quantity=cart_item.quantity,
-            unit_price=product.price,
+        products = (
+            db.query(Product)
+            .filter(Product.id.in_(product_ids))
+            .order_by(Product.id)
+            .with_for_update()
+            .all()
         )
+        product_map = {p.id: p for p in products}
 
-        db.add(order_item)
+        total_amount = Decimal("0.00")
 
-    # ========================================================
-    # 7. Create Payment
-    # ========================================================
+        for item in cart_items:
+            product = product_map.get(item.product_id)
 
-    payment = Payment(
-        order_id=order.id,
-        amount=total_amount,
-        method=payment_method,
-        status=PaymentStatus.PENDING,
-    )
+            if not product:
+                raise HTTPException(400, "Product no longer exists")
 
-    db.add(payment)
+            if not product.is_active:
+                raise HTTPException(
+                    400,
+                    f"Product '{product.name}' is unavailable",
+                )
 
-    # Get generated payment.id
-    db.flush()
+            if item.quantity <= 0:
+                raise HTTPException(400, "Invalid cart quantity")
 
-    # ========================================================
-    # 8. CARD PAYMENT
-    # ========================================================
+            if product.stock < item.quantity:
+                raise HTTPException(
+                    400,
+                    f"Not enough stock for '{product.name}'",
+                )
 
-    if payment_method == PaymentMethod.CARD:
+            total_amount += product.price * item.quantity
 
-        if total_amount < Decimal("140.00"):
+        if (
+            checkout_data.payment_method == PaymentMethod.CARD
+            and total_amount < Decimal("140.00")
+        ):
             raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Card payment requires "
-                    "a higher order amount."
-                ),
+                400,
+                "Card payment requires a higher order amount.",
             )
 
-        try:
+        now = datetime.utcnow()
+        reservation_expiry = (
+            now + timedelta(minutes=CARD_RESERVATION_MINUTES)
+            if checkout_data.payment_method == PaymentMethod.CARD
+            else None
+        )
 
-            payment_session = (
-                await create_payment_session(
-                    order=order,
-                    payment=payment,
+        order = Order(
+            user_id=current_user.id,
+            total_amount=total_amount,
+            status=OrderStatus.PENDING,
+            reservation_expires_at=reservation_expiry,
+            inventory_released_at=None,
+        )
+        db.add(order)
+        db.flush()
+
+        address = checkout_data.order_address
+        db.add(
+            OrderAddress(
+                order_id=order.id,
+                full_name=address.full_name,
+                phone_number=address.phone_number,
+                address_line1=address.address_line1,
+                address_line2=address.address_line2,
+                city=address.city,
+                state=address.state,
+                postal_code=address.postal_code,
+                country=address.country,
+                landmark=address.landmark,
+            )
+        )
+
+        for item in cart_items:
+            product = product_map[item.product_id]
+
+            db.add(
+                OrderItem(
+                    order_id=order.id,
+                    product_id=product.id,
+                    quantity=item.quantity,
+                    unit_price=product.price,
                 )
             )
 
-            payment.session_id = (
-                payment_session.id
-            )
+            # Reserve stock for both CARD and COD.
+            product.stock -= item.quantity
 
-            # Commit:
-            # Order
-            # OrderAddress
-            # OrderItems
-            # Payment
-            # Stripe session ID
-            db.commit()
+        payment = Payment(
+            order_id=order.id,
+            amount=total_amount,
+            method=checkout_data.payment_method,
+            status=PaymentStatus.PENDING,
+        )
+        db.add(payment)
+        db.flush()
 
-        except Exception:
+        # Remove cart items within the same transaction.
+        for item in cart_items:
+            db.delete(item)
 
-            db.rollback()
+        payment_url = None
 
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unable to create payment session",
-            )
+        if checkout_data.payment_method == PaymentMethod.CARD:
+            # Flush order/payment/stock changes, but do not
+            # commit before Stripe session creation succeeds.
+            db.flush()
 
-        db.refresh(order)
-        db.refresh(payment)
-
-        # Clear cart after checkout snapshot
-        # has been successfully created.
-        for cart_item in list(cart.items):
-            db.delete(cart_item)
+            session = await create_payment_session(order, payment)
+            payment.session_id = session.id
+            payment_url = session.url
 
         db.commit()
-
         db.refresh(order)
 
-        return {
-            "payment_method": PaymentMethod.CARD,
-            "order": order,
-            "payment_url": payment_session.url,
-        }
-
-    # ========================================================
-    # 9. COD PAYMENT
-    # ========================================================
-
-    if payment_method == PaymentMethod.COD:
-
-        # For COD, order is accepted immediately.
-        # Payment remains PENDING because the customer
-        # pays when receiving the order.
-
-        order.status = OrderStatus.PENDING
-
-        # Reserve/decrease stock now.
-        for cart_item in cart.items:
-
-            product = locked_products[
-                cart_item.product_id
-            ]
-
-            product.stock -= cart_item.quantity
-
-            db.delete(cart_item)
-
-        try:
-
-            db.commit()
-
-        except Exception:
-
-            db.rollback()
-
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="COD checkout failed",
-            )
-
-        db.refresh(order)
-
-        try:
-
-            await manager.send_to_admin(
-                {
+        if checkout_data.payment_method == PaymentMethod.COD:
+            try:
+                await manager.send_to_admin({
                     "type": "new_order",
                     "order_id": order.id,
                     "user_id": order.user_id,
-                    "total_amount": str(
-                        order.total_amount
-                    ),
+                    "total_amount": str(order.total_amount),
                     "status": order.status.value,
-                }
-            )
-
-        except Exception:
-
-            # WebSocket failure must not
-            # undo the database transaction.
-            pass
+                })
+            except Exception:
+                pass
 
         return {
-            "payment_method": PaymentMethod.COD,
+            "payment_method": checkout_data.payment_method,
             "order": order,
-            "payment_url": None,
+            "payment_url": payment_url,
         }
 
-    # ========================================================
-    # Invalid payment method
-    # ========================================================
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Checkout failed. Please try again.",
+        )
 
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail="Invalid payment method",
+def release_order_inventory(
+    db: Session,
+    order: Order,
+) -> bool:
+    """
+    Release inventory at most once.
+
+    Caller must hold a database row lock on the order.
+    Returns True if stock was released; otherwise False.
+    """
+    if order.inventory_released_at is not None:
+        return False
+
+    # Existing orders without this marker may predate the
+    # reservation implementation. Do not restore their stock
+    # automatically unless their deduction is known.
+    if order.reservation_expires_at is None:
+        return False
+
+    items = (
+        db.query(OrderItem)
+        .filter(OrderItem.order_id == order.id)
+        .order_by(OrderItem.product_id)
+        .all()
     )
 
+    product_ids = sorted({
+        item.product_id for item in items
+    })
 
+    products = (
+        db.query(Product)
+        .filter(Product.id.in_(product_ids))
+        .order_by(Product.id)
+        .with_for_update()
+        .all()
+    )
+    product_map = {p.id: p for p in products}
+
+    for item in items:
+        product = product_map.get(item.product_id)
+        if product is None:
+            raise RuntimeError(
+                f"Product {item.product_id} missing "
+                f"while releasing order {order.id}"
+            )
+
+        product.stock += item.quantity
+
+    order.inventory_released_at = datetime.utcnow()
+    return True
 # ============================================================
 # CANCEL ORDER
 # ============================================================
@@ -336,103 +274,69 @@ async def cancel_order(
     current_user: User,
     order_id: int,
 ):
-
-    # ========================================================
-    # 1. Get and lock user's order
-    # ========================================================
-
-    order = (
-        db.query(Order)
-        .filter(
-            Order.id == order_id,
-            Order.user_id == current_user.id,
-        )
-        .with_for_update()
-        .first()
-    )
-
-    if not order:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
-        )
-
-    # ========================================================
-    # 2. Only pending orders can be cancelled
-    # ========================================================
-
-    if order.status != OrderStatus.PENDING:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only pending orders can be cancelled",
-        )
-
-    # ========================================================
-    # 3. Restore product stock
-    # ========================================================
-
-    for order_item in order.items:
-
-        product = (
-            db.query(Product)
+    try:
+        order = (
+            db.query(Order)
             .filter(
-                Product.id == order_item.product_id
+                Order.id == order_id,
+                Order.user_id == current_user.id,
             )
             .with_for_update()
             .first()
         )
 
-        if product:
-            product.stock += order_item.quantity
+        if not order:
+            raise HTTPException(404, "Order not found")
 
-    # ========================================================
-    # 4. Change order status
-    # ========================================================
+        if order.status != OrderStatus.PENDING:
+            raise HTTPException(
+                400,
+                "Only pending orders can be cancelled",
+            )
 
-    order.status = OrderStatus.CANCELLED
+        payment = (
+            db.query(Payment)
+            .filter(Payment.order_id == order.id)
+            .with_for_update()
+            .first()
+        )
 
-    # ========================================================
-    # 5. Commit transaction
-    # ========================================================
+        if payment and payment.status == PaymentStatus.PAID:
+            raise HTTPException(
+                400,
+                "A paid order cannot be cancelled through this endpoint",
+            )
 
-    try:
+        # For orders created by the new checkout workflow,
+        # stock is restored exactly once.
+        release_order_inventory(db, order)
+
+        order.status = OrderStatus.CANCELLED
 
         db.commit()
+        db.refresh(order)
 
-    except Exception:
-
+    except HTTPException:
         db.rollback()
-
+        raise
+    except Exception:
+        db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to cancel order",
+            500,
+            "Failed to cancel order",
         )
-
-    # ========================================================
-    # 6. Refresh order
-    # ========================================================
-
-    db.refresh(order)
 
     try:
-
-        await manager.send_to_admin(
-            {
-                "type": "order_cancelled",
-                "order_id": order.id,
-                "user_id": order.user_id,
-                "status": order.status.value,
-            }
-        )
-
+        await manager.send_to_admin({
+            "type": "order_cancelled",
+            "order_id": order.id,
+            "user_id": order.user_id,
+            "status": order.status.value,
+        })
     except Exception:
-
-        # Do not rollback here because the DB transaction
-        # has already been committed.
         pass
 
     return order
-
 
 # ============================================================
 # ORDER STATUS TRANSITIONS
@@ -461,97 +365,87 @@ ALLOWED_TRANSITIONS = {
 # ============================================================
 # UPDATE ORDER STATUS
 # ============================================================
-
-
 async def update_order_status(
     db: Session,
     order_id: int,
     new_status: OrderStatus,
 ):
-
-    # ========================================================
-    # 1. Get and lock the order
-    # ========================================================
-
-    order = (
-        db.query(Order)
-        .filter(
-            Order.id == order_id
+    try:
+        order = (
+            db.query(Order)
+            .filter(Order.id == order_id)
+            .with_for_update()
+            .first()
         )
-        .with_for_update()
-        .first()
-    )
 
-    if not order:
+        if not order:
+            raise HTTPException(404, "Order not found")
+
+        allowed = ALLOWED_TRANSITIONS.get(order.status, set())
+
+        if new_status not in allowed:
+            raise HTTPException(
+                400,
+                f"Cannot change order status from "
+                f"'{order.status.value}' to '{new_status.value}'",
+            )
+
+        payment = (
+            db.query(Payment)
+            .filter(Payment.order_id == order.id)
+            .with_for_update()
+            .first()
+        )
+
+        if new_status == OrderStatus.CONFIRMED:
+            if payment and payment.method == PaymentMethod.CARD:
+                if payment.status != PaymentStatus.PAID:
+                    raise HTTPException(
+                        400,
+                        "Card order cannot be confirmed before payment",
+                    )
+
+            if order.inventory_released_at is not None:
+                raise HTTPException(
+                    400,
+                    "Cannot confirm an order whose inventory was released",
+                )
+
+        if new_status == OrderStatus.CANCELLED:
+            if payment and payment.status == PaymentStatus.PAID:
+                raise HTTPException(
+                    400,
+                    "Paid orders require the refund workflow",
+                )
+
+            release_order_inventory(db, order)
+
+        order.status = new_status
+        db.commit()
+        db.refresh(order)
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
+            500,
+            "Failed to update order status",
         )
-
-    # ========================================================
-    # 2. Get allowed next statuses
-    # ========================================================
-
-    allowed_statuses = (
-        ALLOWED_TRANSITIONS[order.status]
-    )
-
-    # ========================================================
-    # 3. Check whether transition is valid
-    # ========================================================
-
-    if new_status not in allowed_statuses:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Cannot change order status "
-                f"from '{order.status.value}' "
-                f"to '{new_status.value}'"
-            ),
-        )
-
-    # ========================================================
-    # 4. Change status
-    # ========================================================
-
-    order.status = new_status
-
-    # ========================================================
-    # 5. Save transaction
-    # ========================================================
 
     try:
-
-        db.commit()
-
-    except Exception:
-
-        db.rollback()
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update order status",
-        )
-
-    # ========================================================
-    # 6. Reload updated order
-    # ========================================================
-
-    db.refresh(order)
-
-    # ========================================================
-    # 7. Send real-time WebSocket event
-    # ========================================================
-
-    await manager.send_to_user(
-        order.user_id,
-        {
-            "event": "order_status_updated",
-            "data": {
-                "order_id": order.id,
-                "status": order.status.value,
+        await manager.send_to_user(
+            order.user_id,
+            {
+                "event": "order_status_updated",
+                "data": {
+                    "order_id": order.id,
+                    "status": order.status.value,
+                },
             },
-        },
-    )
+        )
+    except Exception:
+        pass
 
     return order

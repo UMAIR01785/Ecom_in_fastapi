@@ -77,6 +77,16 @@ class Order(Base):
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
     )
+    
+    reservation_expires_at = Column(
+    DateTime,
+    nullable=True,
+    index=True,  )
+
+    inventory_released_at = Column(
+        DateTime,
+        nullable=True,
+    )
 
     # ============================================================
     # USER

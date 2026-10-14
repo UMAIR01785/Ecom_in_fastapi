@@ -6,7 +6,7 @@ from fastapi import (
     HTTPException,
     Request,
 )
-
+from datetime import datetime, timedelta
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
@@ -20,6 +20,7 @@ from app.models.order import (
 
 from app.models.payment import (
     Payment,
+    PaymentMethod,
     PaymentStatus,
 )
 
@@ -37,7 +38,9 @@ from app.websockets.manager import manager
 # Use the actual location of get_current_user
 # from your project.
 from app.dependencies.auth import get_current_user
+import logging
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/payments",
@@ -50,385 +53,161 @@ router = APIRouter(
 # ============================================================
 
 @router.post("/webhook")
-async def stripe_webhook(
-    request: Request,
-):
-
-    # ========================================================
-    # 1. Get raw Stripe request
-    # ========================================================
-
+async def stripe_webhook(request: Request):
     payload = await request.body()
-
-    signature = request.headers.get(
-        "stripe-signature"
-    )
+    signature = request.headers.get("stripe-signature")
 
     if not signature:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing Stripe signature",
-        )
-
-    # ========================================================
-    # 2. Verify Stripe webhook signature
-    # ========================================================
+        raise HTTPException(400, "Missing Stripe signature")
 
     try:
-
         event = stripe.Webhook.construct_event(
             payload,
             signature,
             settings.stripe_webhook_secret,
         )
-
     except ValueError:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid payload",
-        )
-
+        raise HTTPException(400, "Invalid payload")
     except stripe.error.SignatureVerificationError:
+        raise HTTPException(400, "Invalid Stripe signature")
 
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid Stripe signature",
-        )
+    event_type = event["type"]
 
-    # ========================================================
-    # 3. Only process checkout.session.completed
-    # ========================================================
+    if event_type not in {
+        "checkout.session.completed",
+        "checkout.session.expired",
+    }:
+        return {"received": True, "message": "Event ignored"}
 
-    if event["type"] != "checkout.session.completed":
-
-        return {
-            "received": True,
-            "message": "Event ignored",
-        }
-
-    # ========================================================
-    # 4. Get Stripe Checkout Session
-    # ========================================================
-
-    # Stripe returns a StripeObject, not a normal dict.
-    # Convert it so .get() works.
     session = event["data"]["object"].to_dict()
-
-    # ========================================================
-    # 5. Check Stripe payment status
-    # ========================================================
-
-    if session.get("payment_status") != "paid":
-
-        return {
-            "received": True,
-            "message": "Payment is not paid yet",
-        }
-
-    # ========================================================
-    # 6. Get metadata
-    # ========================================================
-
     metadata = session.get("metadata") or {}
 
-    payment_id = metadata.get(
-        "payment_id"
-    )
+    try:
+        payment_id = int(metadata["payment_id"])
+        order_id = int(metadata["order_id"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "Payment metadata missing or invalid")
 
-    order_id = metadata.get(
-        "order_id"
-    )
-
-    if not payment_id or not order_id:
-
-        raise HTTPException(
-            status_code=400,
-            detail="Payment metadata missing",
-        )
-
-    # ========================================================
-    # 7. Create database session
-    # ========================================================
-
-    db: Session = SessionLocal()
+    db = SessionLocal()
 
     try:
-
-        # ====================================================
-        # 8. Find payment and lock it
-        # ====================================================
-
-        payment = (
-            db.query(Payment)
-            .filter(
-                Payment.id == int(payment_id)
-            )
+        # Always lock the order and payment in the same order
+        # in all payment lifecycle handlers.
+        order = (
+            db.query(Order)
+            .filter(Order.id == order_id)
             .with_for_update()
             .first()
         )
 
-        if not payment:
+        payment = (
+            db.query(Payment)
+            .filter(Payment.id == payment_id)
+            .with_for_update()
+            .first()
+        )
 
-            raise HTTPException(
-                status_code=404,
-                detail="Payment not found",
-            )
+        if not order or not payment:
+            raise HTTPException(404, "Order or payment not found")
 
-        # ====================================================
-        # 9. Idempotency check
-        # ====================================================
+        if payment.order_id != order.id:
+            raise HTTPException(400, "Payment/order mismatch")
+
+        if payment.session_id != session.get("id"):
+            raise HTTPException(400, "Stripe session mismatch")
+
+        if payment.method != PaymentMethod.CARD:
+            raise HTTPException(400, "Unexpected payment method")
+
+        if event_type == "checkout.session.expired":
+            if (
+                order.status == OrderStatus.PENDING
+                and payment.status == PaymentStatus.PENDING
+                and order.inventory_released_at is None
+            ):
+                from app.services.oder_servies import (
+                    release_order_inventory,
+                )
+
+                release_order_inventory(db, order)
+                order.status = OrderStatus.CANCELLED
+                payment.status = PaymentStatus.FAILED
+
+            db.commit()
+            return {
+                "received": True,
+                "message": "Checkout expiry processed",
+            }
+
+        # A completed event is only treated as paid when
+        # Stripe explicitly reports payment_status=paid.
+        if session.get("payment_status") != "paid":
+            db.commit()
+            return {
+                "received": True,
+                "message": "Payment not completed",
+            }
+
+        expected_amount = int(payment.amount * 100)
+
+        if session.get("amount_total") != expected_amount:
+            raise HTTPException(400, "Payment amount mismatch")
 
         if payment.status == PaymentStatus.PAID:
-
+            db.commit()
             return {
                 "received": True,
                 "message": "Payment already processed",
             }
 
-        # ====================================================
-        # 10. Verify Stripe session
-        # ====================================================
-
-        if payment.session_id != session["id"]:
-
+        # Never resurrect a canceled order or an order whose
+        # inventory was released. Refund handling is required.
+        if (
+            order.status == OrderStatus.CANCELLED
+            or order.inventory_released_at is not None
+        ):
+            db.rollback()
             raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Stripe session does not "
-                    "match payment"
-                ),
+                409,
+                "Payment arrived after cancellation or inventory release; "
+                "payment reconciliation is required",
             )
-
-        # ====================================================
-        # 11. Verify payment belongs to order
-        # ====================================================
-
-        if payment.order_id != int(order_id):
-
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Payment does not belong "
-                    "to order"
-                ),
-            )
-
-        # ====================================================
-        # 12. Get and lock order
-        #
-        # Do NOT use joinedload(Order.items)
-        # with with_for_update().
-        # ====================================================
-
-        order = (
-            db.query(Order)
-            .filter(
-                Order.id == int(order_id)
-            )
-            .with_for_update()
-            .first()
-        )
-
-        if not order:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Order not found",
-            )
-
-        # ====================================================
-        # 13. Get order items separately
-        # ====================================================
-
-        order_items = (
-            db.query(OrderItem)
-            .filter(
-                OrderItem.order_id == order.id
-            )
-            .all()
-        )
-
-        # ====================================================
-        # 14. Verify amount
-        # ====================================================
-
-        stripe_amount = session.get(
-            "amount_total"
-        )
-
-        expected_amount = int(
-            payment.amount * 100
-        )
-
-        if stripe_amount != expected_amount:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Payment amount mismatch",
-            )
-
-        # ====================================================
-        # 15. Update product stock
-        # ====================================================
-
-        for order_item in order_items:
-
-            product = (
-                db.query(Product)
-                .filter(
-                    Product.id ==
-                    order_item.product_id
-                )
-                .with_for_update()
-                .first()
-            )
-
-            if not product:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail="Product no longer exists",
-                )
-
-            if not product.is_active:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Product '{product.name}' "
-                        "is no longer available"
-                    ),
-                )
-
-            if product.stock < order_item.quantity:
-
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Not enough stock for "
-                        f"'{product.name}'"
-                    ),
-                )
-
-            product.stock -= (
-                order_item.quantity
-            )
-
-        # ====================================================
-        # 16. Update payment
-        # ====================================================
 
         payment.status = PaymentStatus.PAID
-
-        payment.transaction_id = (
-            session.get("payment_intent")
-        )
-
-        # ====================================================
-        # 17. Update order
-        # ====================================================
-
+        payment.transaction_id = session.get("payment_intent")
+        payment.paid_at = datetime.utcnow()
         order.status = OrderStatus.CONFIRMED
 
-        # ====================================================
-        # 18. Commit everything
-        # ====================================================
-
+        # Stock was already deducted at checkout.
         db.commit()
 
-        # ====================================================
-        # 19. Notify admin
-        # ====================================================
-
         try:
-
             await manager.send_to_admin({
-
                 "type": "payment_completed",
-
-                "payment_id":
-                    payment.id,
-
-                "order_id":
-                    order.id,
-
-                "user_id":
-                    order.user_id,
-
-                "amount":
-                    str(payment.amount),
-
-                "status":
-                    payment.status.value,
-
-                "transaction_id":
-                    payment.transaction_id,
+                "payment_id": payment.id,
+                "order_id": order.id,
+                "user_id": order.user_id,
+                "amount": str(payment.amount),
+                "status": payment.status.value,
+                "transaction_id": payment.transaction_id,
             })
-
         except Exception:
-
-            # Payment is already committed.
-            # WebSocket failure must not
-            # rollback the payment.
-
             pass
 
         return {
             "received": True,
-            "message": (
-                "Payment processed successfully"
-            ),
+            "message": "Payment processed successfully",
         }
 
-    # ========================================================
-    # HTTP exception
-    # ========================================================
-
     except HTTPException:
-
         db.rollback()
-
         raise
-
-    # ========================================================
-    # Stripe exception
-    # ========================================================
-
-    except stripe.error.StripeError as e:
-
+    except Exception:
         db.rollback()
-
-        raise HTTPException(
-            status_code=400,
-            detail=str(e),
-        )
-
-    # ========================================================
-    # Any other error
-    # ========================================================
-
-    except Exception as e:
-
-        db.rollback()
-
-        print(
-            "WEBHOOK ERROR:",
-            repr(e)
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Webhook error: {str(e)}"
-            ),
-        )
-
+        logger.exception("Stripe webhook processing failed")
+        raise HTTPException(500, "Webhook processing failed")
     finally:
-
         db.close()
-
-
 # ============================================================
 # CUSTOMER PAYMENT RECEIPT
 # ============================================================
