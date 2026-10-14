@@ -1,5 +1,6 @@
 
 from datetime import datetime, timezone
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -14,6 +15,12 @@ from app.schemas.chat import (
     ChatMessageCreate,
     ChatMessageResponse,
 )
+from app.services.chat_service import (
+    send_chat_message,
+    ChatAIError,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/admin/chat",
@@ -27,6 +34,7 @@ def get_admin_conversation(
     admin_id: int,
 ) -> ChatConversation:
     """Fetch a conversation only if it belongs to this admin."""
+
     conversation = (
         db.query(ChatConversation)
         .filter(
@@ -55,14 +63,32 @@ def create_conversation(
     db: Session = Depends(get_db),
     admin: User = Depends(admin_required),
 ):
+    """Create a new conversation for the logged-in admin."""
+
+    title = data.title.strip()
+
+    if not title:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Conversation title cannot be empty",
+        )
+
     conversation = ChatConversation(
         admin_id=admin.id,
-        title=data.title.strip(),
+        title=title,
     )
 
-    db.add(conversation)
-    db.commit()
-    db.refresh(conversation)
+    try:
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to create admin chat conversation")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create conversation",
+        )
 
     return conversation
 
@@ -75,6 +101,8 @@ def list_conversations(
     db: Session = Depends(get_db),
     admin: User = Depends(admin_required),
 ):
+    """List only the logged-in admin's conversations."""
+
     return (
         db.query(ChatConversation)
         .filter(ChatConversation.admin_id == admin.id)
@@ -92,6 +120,8 @@ def get_conversation_messages(
     db: Session = Depends(get_db),
     admin: User = Depends(admin_required),
 ):
+    """Retrieve messages from a conversation owned by this admin."""
+
     conversation = get_admin_conversation(
         db=db,
         conversation_id=conversation_id,
@@ -122,6 +152,11 @@ def save_user_message(
     db: Session = Depends(get_db),
     admin: User = Depends(admin_required),
 ):
+    """
+    Save the admin's question, run the AI agent,
+    save the AI answer, and return the assistant message.
+    """
+
     conversation = get_admin_conversation(
         db=db,
         conversation_id=conversation_id,
@@ -136,26 +171,31 @@ def save_user_message(
             detail="Message cannot be empty",
         )
 
-    message = ChatMessage(
-        conversation_id=conversation.id,
-        role="user",
-        content=content,
-    )
-
-    conversation.updated_at = datetime.now(timezone.utc)
-
     try:
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-    except Exception:
-        db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to save message",
+        assistant_message = send_chat_message(
+            db=db,
+            conversation_id=conversation.id,
+            content=content,
         )
 
-    return message
+        return assistant_message
+
+    except ChatAIError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "The AI assistant could not generate a response. "
+                "Your message may already be saved. Please try again."
+            ),
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to process admin chat message")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process chat message",
+        )
 
 
 @router.delete(
@@ -167,6 +207,8 @@ def delete_conversation(
     db: Session = Depends(get_db),
     admin: User = Depends(admin_required),
 ):
+    """Delete a conversation and its related messages."""
+
     conversation = get_admin_conversation(
         db=db,
         conversation_id=conversation_id,
@@ -178,6 +220,7 @@ def delete_conversation(
         db.commit()
     except Exception:
         db.rollback()
+        logger.exception("Failed to delete admin chat conversation")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete conversation",
