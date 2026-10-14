@@ -87,6 +87,10 @@ class Order(Base):
         DateTime,
         nullable=True,
     )
+    inventory_deducted_at = Column(
+    DateTime,
+    nullable=True,
+)
 
     # ============================================================
     # USER

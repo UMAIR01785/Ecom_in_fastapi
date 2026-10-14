@@ -213,23 +213,23 @@ async def checkout_cart(
             detail="Checkout failed. Please try again.",
         )
 
+
 def release_order_inventory(
     db: Session,
     order: Order,
 ) -> bool:
     """
-    Release inventory at most once.
+    Restore inventory only when:
+    1. The order's inventory was deducted.
+    2. The inventory has not already been released.
 
-    Caller must hold a database row lock on the order.
-    Returns True if stock was released; otherwise False.
+    The caller must lock the order before calling this function.
     """
     if order.inventory_released_at is not None:
         return False
 
-    # Existing orders without this marker may predate the
-    # reservation implementation. Do not restore their stock
-    # automatically unless their deduction is known.
-    if order.reservation_expires_at is None:
+    # Do not guess for old orders whose inventory state is unknown.
+    if order.inventory_deducted_at is None:
         return False
 
     items = (
@@ -250,20 +250,25 @@ def release_order_inventory(
         .with_for_update()
         .all()
     )
-    product_map = {p.id: p for p in products}
+
+    product_map = {product.id: product for product in products}
 
     for item in items:
         product = product_map.get(item.product_id)
+
         if product is None:
             raise RuntimeError(
-                f"Product {item.product_id} missing "
+                f"Product {item.product_id} is missing "
                 f"while releasing order {order.id}"
             )
 
         product.stock += item.quantity
 
+    # Record the release in the same transaction as the stock update.
     order.inventory_released_at = datetime.utcnow()
+
     return True
+
 # ============================================================
 # CANCEL ORDER
 # ============================================================
