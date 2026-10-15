@@ -8,6 +8,7 @@ from app.routers.cart import router as cart_router
 from app.routers.websocket import router as websocket_router
 from app.routers import admin_payment
 from app.routers.order import router as order_router
+from app.routers.admin_user import router as admin_user_router
 from app.routers.admin_oder import router as admin_router
 from app.routers import payment
 from app.routers.admin_reporting import router as admin_reporting_router
@@ -19,6 +20,7 @@ app = FastAPI(
 )
 
 app.include_router(admin_reporting_router)
+app.include_router(admin_user_router)
 app.include_router(websocket_router)
 app.include_router(admin_payment.router)
 app.include_router(auth_router)

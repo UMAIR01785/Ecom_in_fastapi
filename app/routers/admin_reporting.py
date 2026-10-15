@@ -406,6 +406,10 @@ def report_payments(
             func.count(Payment.id).label("payment_count"),
             func.sum(Payment.amount).label("amount_total"),
         )
+        .join(Order, Order.id == Payment.order_id)
+        .filter(
+            Order.status != OrderStatus.CANCELLED,
+        )
     )
 
     query = apply_date_filter(

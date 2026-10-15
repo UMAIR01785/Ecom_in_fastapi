@@ -9,8 +9,9 @@ from fastapi import (
     HTTPException,
     UploadFile,
     status,
+    Query,
 )
-
+from app.schemas.pagination import PaginatedResponse,PaginationParams
 from sqlalchemy.orm import Session
 
 from app.core.cloudinary import upload_product_image
@@ -148,6 +149,8 @@ async def create_product(
     response_model=list[ProductResponse],
 )
 def get_all_products_admin(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user=Depends(admin_required),
 ):
@@ -163,20 +166,48 @@ def get_all_products_admin(
 # CUSTOMER - GET ACTIVE PRODUCTS
 # ============================================================
 
-@router.get(
-    "/",
-    response_model=list[ProductResponse],
-)
+from math import ceil
+
+from fastapi import Depends, Query
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.product import Product
+from app.schemas.pagination import PaginatedResponse
+from app.schemas.product import ProductResponse
+
+
+@router.get("/", response_model=PaginatedResponse[ProductResponse])
 def get_products(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    products = (
+    query = (
         db.query(Product)
-        .filter(Product.is_active == True)
+        .filter(Product.is_active.is_(True))
+    )
+
+    total = query.count()
+
+    products = (
+        query
+        .order_by(Product.id)
+        .offset((page - 1) * limit)
+        .limit(limit)
         .all()
     )
 
-    return products
+    total_pages = ceil(total / limit) if total else 0
+
+    return {
+        "items": products,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+    }
+
 
 
 # ============================================================

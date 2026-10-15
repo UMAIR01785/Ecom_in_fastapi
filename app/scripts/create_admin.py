@@ -1,5 +1,7 @@
-from getpass import getpass
 
+import app.models
+
+from getpass import getpass
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
@@ -17,34 +19,47 @@ def create_admin():
         first_name = input("First name: ").strip()
         last_name = input("Last name: ").strip()
         username = input("Username: ").strip()
-        email = input("Email: ").strip()
+        email = input("Email: ").strip().lower()
         phone_number = input("Phone number: ").strip()
 
         password = getpass("Password: ")
         confirm_password = getpass("Confirm password: ")
 
+        # Validate required fields
+        if not all([
+            first_name,
+            last_name,
+            username,
+            email,
+            phone_number,
+            password,
+        ]):
+            print("All fields are required.")
+            return
+
         if password != confirm_password:
             print("Passwords do not match.")
             return
 
-        # Check email
-        if db.query(User).filter(User.email == email).first():
-            print("Email already exists.")
+        # Check for existing email, username, or phone
+        existing_user = (
+            db.query(User)
+            .filter(
+                (User.email == email)
+                | (User.username == username)
+                | (User.phone_number == phone_number)
+            )
+            .first()
+        )
+
+        if existing_user:
+            print(
+                "Email, username, or phone number "
+                "already exists."
+            )
             return
 
-        # Check username
-        if db.query(User).filter(User.username == username).first():
-            print("Username already exists.")
-            return
-
-        # Check phone number
-        if db.query(User).filter(
-            User.phone_number == phone_number
-        ).first():
-            print("Phone number already exists.")
-            return
-
-        # Create admin user
+        # Create admin
         admin = User(
             first_name=first_name,
             last_name=last_name,
@@ -57,16 +72,15 @@ def create_admin():
         )
 
         db.add(admin)
+        db.flush()  # Generates admin.id without committing
+
+        # Create the associated profile
+        profile = Profile(user_id=admin.id)
+        db.add(profile)
+
+        # Save both records in one transaction
         db.commit()
         db.refresh(admin)
-
-        # Create admin profile
-        profile = Profile(
-            user_id=admin.id
-        )
-
-        db.add(profile)
-        db.commit()
         db.refresh(profile)
 
         print("\nAdmin created successfully!")
@@ -78,7 +92,7 @@ def create_admin():
 
     except Exception as e:
         db.rollback()
-        print(f"Error: {e}")
+        print(f"Error creating admin: {e}")
 
     finally:
         db.close()
