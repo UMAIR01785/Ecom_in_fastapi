@@ -1,95 +1,203 @@
 # Ecom_in_fastapi
 
-A FastAPI-based e-commerce backend project for authentication and user profile management.
+Backend API for an e-commerce platform built with FastAPI, SQLAlchemy, PostgreSQL, Stripe, Cloudinary, WebSockets, and an admin AI chat assistant.
 
-## Overview
+## What this backend includes
 
-This project is built with FastAPI and SQLAlchemy to provide a backend API for an e-commerce application.  
-It currently focuses on user account features such as registration, login, token generation, and automatic profile creation.
+- JWT auth with **access + refresh token rotation**
+- Role-based access (**customer/admin**)
+- User profile management with Cloudinary profile images
+- Category and product management (admin CRUD + public listing)
+- Guest and authenticated shopping carts (with cart merge on login)
+- Checkout with shipping address + order item snapshot pricing
+- Payment handling for **COD** and **Stripe card checkout**
+- Stripe webhook processing for payment confirmation/expiry
+- Inventory reservation/release logic tied to order lifecycle
+- Admin order management and reporting dashboards
+- WebSocket updates for customer order status + admin live events
+- Admin AI chat assistant with database tools (orders/payments/products/categories)
 
-## Features
+## Tech stack
 
-- User registration
-- User login
-- JWT access token creation
-- Password hashing
-- Email, username, and phone number validation
-- Automatic profile creation for every new user
-- Database session handling with SQLAlchemy
-- Pydantic schema validation
+- FastAPI
+- SQLAlchemy
+- Alembic
+- PostgreSQL
+- Pydantic / pydantic-settings
+- JWT (`pyjwt`, `python-jose`)
+- `pwdlib[argon2]` for password hashing
+- Stripe
+- Cloudinary
+- LangChain + Groq (admin AI chat)
 
-## Tech Stack
+## Project structure
 
-- **FastAPI** — API framework
-- **SQLAlchemy** — ORM and database models
-- **Pydantic** — request and response validation
-- **PyJWT** — token generation
-- **pwdlib** — password hashing
-- **phonenumbers** — phone number validation
-- **python-dotenv** — environment variable loading
-- **PostgreSQL** — database
+- `/app/main.py` - FastAPI app and router registration
+- `/app/config.py` - environment settings
+- `/app/database.py` - engine/session/base
+- `/app/models` - SQLAlchemy models
+- `/app/schemas` - request/response schemas
+- `/app/routers` - API endpoints
+- `/app/services` - business logic (cart/order/payment/chat/inventory)
+- `/app/dependencies` - auth and role checks
+- `/app/websockets` - WS auth and connection manager
+- `/app/ai` - admin AI agent, prompts, and tools
+- `/app/scripts` - seed/admin utility scripts
+- `/alembic` - DB migrations
 
-## Project Structure
+## Core domain models
 
-- `app/main.py` — FastAPI app entry point
-- `app/database.py` — database connection and session handling
-- `app/core/security.py` — JWT token creation
-- `app/models/user.py` — user model
-- `app/models/profile.py` — profile model
-- `app/routers/auth.py` — authentication routes
-- `app/schemas/user.py` — user schemas and validation
-- `alembic/` — database migrations
-- `main.py` — launcher script
+- Users, Profiles, RefreshTokens
+- Categories, Products (many-to-many)
+- Carts, CartItems
+- Orders, OrderItems, OrderAddress
+- Payments
+- ChatConversations, ChatMessages
 
-## Authentication Flow
+## Environment variables
 
-### Registration
-When a user registers:
+Create `.env` in the repository root with:
 
-1. The system checks whether the email already exists.
-2. The system checks whether the username already exists.
-3. The password and confirm password must match.
-4. The password must be at least 8 characters long.
-5. The password is hashed securely.
-6. The user is saved in the database.
-7. A profile is automatically created for the new user.
+```env
+DATABASE_URL=******localhost:5432/dbname
 
-### Login
-When a user logs in:
+CLOUDINARY_CLOUD_NAME=...
+CLOUDINARY_API_KEY=...
+CLOUDINARY_API_SECRET=...
 
-1. The user is found by email.
-2. The password is verified against the stored hash.
-3. If valid, a JWT access token is returned.
+SECRET_KEY=...
+ALGORITHM=HS256
 
-## API Endpoints
+STRIPE_SECRET_KEY=...
+STRIPE_WEBHOOK_SECRET=...
 
-### `GET /`
-Simple health/status endpoint to confirm the app is running.
+GROQ_API_KEY=...
 
-### `POST /accounts/register`
-Registers a new user.
+# false in local HTTP dev, true in HTTPS production
+REFRESH_COOKIE_SECURE=false
+```
 
-**Request fields:**
-- `first_name`
-- `last_name`
-- `email`
-- `username`
-- `password`
-- `confirm_password`
-- `phone_number`
+## Local setup
 
-**Rules:**
-- Email must be unique
-- Username must be unique
-- Passwords must match
-- Password length must be greater than 8
-- Phone number must be valid
+### 1) Install dependencies
 
-### `POST /accounts/login`
-Logs in a user and returns:
+Using `uv`:
 
-```json
-{
-  "access_token": "your_token_here",
-  "token_type": "bearer"
-}
+```bash
+uv sync
+```
+
+or using pip:
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2) Run migrations
+
+```bash
+alembic upgrade head
+```
+
+### 3) Start API server
+
+```bash
+uvicorn app.main:app --reload
+```
+
+Open docs at:
+
+- `http://127.0.0.1:8000/docs`
+- `http://127.0.0.1:8000/redoc`
+
+## API overview
+
+### Public / Auth
+
+- `GET /` - API health message
+- `POST /accounts/register`
+- `POST /accounts/login`
+- `POST /accounts/refresh`
+- `POST /accounts/logout`
+
+### Profile (authenticated)
+
+- `GET /profile`
+- `PATCH /profile/update`
+- `POST /profile/image`
+- `DELETE /profile/image`
+
+### Categories
+
+- Public: `GET /categories/`, `GET /categories/{slug}`
+- Admin: `GET /categories/admin/all`, `POST /categories/admin`, `PATCH /categories/admin/{slug}`, `DELETE /categories/admin/{slug}`
+
+### Products (mounted under `/products`)
+
+- Public: `GET /products/`, `GET /products/{category_slug}`, `GET /products/{category_slug}/{product_slug}`
+- Admin: `POST /products/`, `GET /products/admin/products`, `PUT /products/{category_slug}/{product_slug}`, `DELETE /products/{category_slug}/{product_slug}`
+
+### Cart
+
+- `POST /cart/items`
+- `GET /cart`
+- `PATCH /cart/items/{product_id}`
+- `DELETE /cart/items/{product_id}`
+- `DELETE /cart`
+- `POST /cart/merge`
+
+### Orders
+
+- Customer: `POST /orders/checkout`, `GET /orders/`, `GET /orders/{order_id}`, `PATCH /orders/{order_id}/cancel`
+- Admin: `GET /admin/orders/`, `GET /admin/orders/{order_id}`, `PATCH /admin/orders/{order_id}/status`
+
+### Payments
+
+- Stripe webhook: `POST /payments/webhook`
+- Customer receipt: `GET /payments/{payment_id}/receipt`
+- Admin payments: `GET /admin/payments/`, `GET /admin/payments/{payment_id}`
+
+### Admin reporting
+
+- `GET /admin/reports/overview`
+- `GET /admin/reports/sales`
+- `GET /admin/reports/order-statuses`
+- `GET /admin/reports/top-products`
+- `GET /admin/reports/payments`
+- `GET /admin/reports/inventory`
+
+### Admin utilities
+
+- `GET /admin/users/`
+- Admin chat:
+  - `POST /admin/chat/conversations`
+  - `GET /admin/chat/conversations`
+  - `GET /admin/chat/conversations/{conversation_id}/messages`
+  - `POST /admin/chat/conversations/{conversation_id}/messages`
+  - `DELETE /admin/chat/conversations/{conversation_id}`
+
+## WebSocket endpoints
+
+- Customer order updates: `ws://<host>/ws/orders?token=<access_token>`
+- Admin live updates: `ws://<host>/ws/admin/orders?token=<access_token>`
+
+Admin socket receives events like new orders, payment completion, and inventory updates.
+
+## Included scripts
+
+- Create admin user:
+  ```bash
+  python -m app.scripts.create_admin
+  ```
+- Seed fake categories/products (optional orders):
+  ```bash
+  python -m app.scripts.seed_data
+  python -m app.scripts.seed_data --force
+  python -m app.scripts.seed_data --orders
+  ```
+
+## Notes
+
+- Refresh token is stored in an HTTP-only cookie (`/accounts` path).
+- Card checkout currently uses Stripe success/cancel URLs pointing to `http://localhost:5173/...`.
+- `main.py` at repository root is not the API entrypoint; use `app.main:app`.
