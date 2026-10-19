@@ -12,6 +12,7 @@ from app.routers.admin_user import router as admin_user_router
 from app.routers.admin_oder import router as admin_router
 from app.routers import payment
 from app.routers.admin_reporting import router as admin_reporting_router
+from app.routers.refund import router as refund_router
 from app.routers.admin_chat import router as admin_chat_router
 app = FastAPI(
     title="E-Commerce API",
@@ -31,14 +32,24 @@ app.include_router(cart_router)
 app.include_router(order_router)
 app.include_router(admin_router)
 app.include_router(payment.router)
+app.include_router(refund_router)
 app.include_router(admin_chat_router)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174"],
+    allow_origins=[
+        "https://dev-umair.me",
+        "https://www.dev-umair.me",
+        "https://admin.dev-umair.me",
+        "https://ecomadminpannel.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:5174",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.get("/")
 def root():

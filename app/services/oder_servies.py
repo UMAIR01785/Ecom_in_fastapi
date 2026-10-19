@@ -1,4 +1,3 @@
-
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -555,8 +554,50 @@ async def update_order_status(
             if inventory_changed:
                 inventory_products = get_order_products(db, order.id)
 
+        # ====================================================
+        # NEW: UPDATE PAYMENT WHEN COD ORDER IS DELIVERED
+        # ====================================================
+
+        if new_status == OrderStatus.DELIVERED:
+
+            if not payment:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Payment record not found for this order",
+                )
+
+            if payment.method == PaymentMethod.COD:
+
+                # Mark COD payment as paid when cash collection
+                # has been confirmed by the delivery workflow.
+                if payment.status == PaymentStatus.PENDING:
+                    payment.status = PaymentStatus.PAID
+                    payment.paid_at = datetime.utcnow()
+
+                elif payment.status != PaymentStatus.PAID:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "COD payment cannot be marked paid "
+                            "from its current status"
+                        ),
+                    )
+
+            elif payment.method == PaymentMethod.CARD:
+
+                # A card order must already have been paid by Stripe.
+                if payment.status != PaymentStatus.PAID:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "Card payment must be paid before delivery"
+                        ),
+                    )
+
+        # Update the order status.
         order.status = new_status
 
+        # Both the order and payment changes are saved together.
         db.commit()
         db.refresh(order)
 

@@ -7,6 +7,7 @@ from app.models.product import Product
 from app.models.cart import Cart, CartItem
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.order import Order, OrderItem
+from app.models.refund import Refund
 from app.models.order_address import OrderAddress
 from logging.config import fileConfig
 import os

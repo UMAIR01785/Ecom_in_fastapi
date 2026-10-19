@@ -57,10 +57,13 @@ async def create_payment_session(
             }
         },
         success_url=(
-            "http://localhost:5173/payment/success"
-            "?session_id={CHECKOUT_SESSION_ID}"
-        ),
-        cancel_url="http://localhost:5173/payment/cancel",
+    "https://dev-umair.me/"
+    "payment/success?session_id={CHECKOUT_SESSION_ID}"
+),
+        cancel_url=(
+    "https://dev-umair.me/"
+    "payment/cancel"
+),
         idempotency_key=f"checkout-order-{order.id}",
     )
 
