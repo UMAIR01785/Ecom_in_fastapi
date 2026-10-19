@@ -1,5 +1,5 @@
 from app.utils.slug import generate_slug
-
+from app.websockets.manager import manager
 from fastapi import (
     APIRouter,
     Depends,
@@ -149,7 +149,12 @@ async def create_category(
     db.commit()
     db.refresh(category)
 
-    return category
+    await manager.broadcast_to_catalog({
+    "type": "catalog_updated",
+    "entity": "category",
+    "action": "created",
+    "id": category.id,
+})
 
 
 # ============================================================
@@ -280,7 +285,12 @@ async def update_category(
     db.commit()
     db.refresh(category)
 
-    return category
+    await manager.broadcast_to_catalog({
+    "type": "catalog_updated",
+    "entity": "category",
+    "action": "updated",
+    "id": category.id,
+})
 
 
 # ============================================================
@@ -296,7 +306,7 @@ async def update_category(
     "/admin/{slug}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
-def delete_category(
+async def delete_category(
     slug: str,
     current_user: User = Depends(admin_required),
     db: Session = Depends(get_db),
@@ -322,8 +332,17 @@ def delete_category(
     # Delete category
     # --------------------------------------------------------
 
+    category_id = category.id
+
     db.delete(category)
     db.commit()
+
+    await manager.broadcast_to_catalog({
+        "type": "catalog_updated",
+        "entity": "category",
+        "action": "deleted",
+        "id": category_id,
+    })
 
     return None
 

@@ -478,6 +478,9 @@ ALLOWED_TRANSITIONS = {
 # ============================================================
 # UPDATE ORDER STATUS
 # ============================================================
+# ============================================================
+# UPDATE ORDER STATUS + REAL-TIME PAYMENT NOTIFICATIONS
+# ============================================================
 
 async def update_order_status(
     db: Session,
@@ -488,6 +491,7 @@ async def update_order_status(
     inventory_changed = False
 
     try:
+        # Lock the order to prevent simultaneous status updates.
         order = (
             db.query(Order)
             .filter(Order.id == order_id)
@@ -513,6 +517,7 @@ async def update_order_status(
                 ),
             )
 
+        # Find and lock the payment associated with this order.
         payment = (
             db.query(Payment)
             .filter(Payment.order_id == order.id)
@@ -520,7 +525,7 @@ async def update_order_status(
             .first()
         )
 
-        # A card order cannot be confirmed until payment succeeds.
+        # Card orders cannot be confirmed before payment succeeds.
         if new_status == OrderStatus.CONFIRMED:
             if (
                 payment
@@ -541,7 +546,7 @@ async def update_order_status(
                     ),
                 )
 
-        # Restore inventory if the admin cancels an unpaid order.
+        # Restore stock if the admin cancels an unpaid order.
         if new_status == OrderStatus.CANCELLED:
             if payment and payment.status == PaymentStatus.PAID:
                 raise HTTPException(
@@ -554,12 +559,10 @@ async def update_order_status(
             if inventory_changed:
                 inventory_products = get_order_products(db, order.id)
 
-        # ====================================================
-        # NEW: UPDATE PAYMENT WHEN COD ORDER IS DELIVERED
-        # ====================================================
-
+        # ----------------------------------------------------
+        # COD PAYMENT UPDATE ON DELIVERY
+        # ----------------------------------------------------
         if new_status == OrderStatus.DELIVERED:
-
             if not payment:
                 raise HTTPException(
                     status_code=400,
@@ -567,10 +570,8 @@ async def update_order_status(
                 )
 
             if payment.method == PaymentMethod.COD:
-
-                # Mark COD payment as paid when cash collection
-                # has been confirmed by the delivery workflow.
                 if payment.status == PaymentStatus.PENDING:
+                    # Assumes cash was collected at delivery.
                     payment.status = PaymentStatus.PAID
                     payment.paid_at = datetime.utcnow()
 
@@ -584,22 +585,22 @@ async def update_order_status(
                     )
 
             elif payment.method == PaymentMethod.CARD:
-
-                # A card order must already have been paid by Stripe.
                 if payment.status != PaymentStatus.PAID:
                     raise HTTPException(
                         status_code=400,
-                        detail=(
-                            "Card payment must be paid before delivery"
-                        ),
+                        detail="Card payment must be paid before delivery",
                     )
 
-        # Update the order status.
+        # Update order status.
         order.status = new_status
 
-        # Both the order and payment changes are saved together.
+        # Save order and payment changes together.
         db.commit()
+
         db.refresh(order)
+
+        if payment:
+            db.refresh(payment)
 
     except HTTPException:
         db.rollback()
@@ -607,6 +608,7 @@ async def update_order_status(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Failed to update status for order %s",
             order_id,
@@ -617,7 +619,43 @@ async def update_order_status(
             detail="Failed to update order status",
         )
 
-    # Notify the customer of the status change.
+    # --------------------------------------------------------
+    # PREPARE DATA AFTER THE DATABASE COMMIT
+    # --------------------------------------------------------
+    order_status = getattr(
+        order.status,
+        "value",
+        str(order.status),
+    )
+
+    payment_status = (
+        getattr(payment.status, "value", str(payment.status))
+        if payment
+        else None
+    )
+
+    payment_method = (
+        getattr(payment.method, "value", str(payment.method))
+        if payment
+        else None
+    )
+
+    payment_data = {
+        "order_id": order.id,
+        "payment_id": payment.id if payment else None,
+        "payment_method": payment_method,
+        "payment_status": payment_status,
+        "order_status": order_status,
+        "paid_at": (
+            payment.paid_at.isoformat()
+            if payment and payment.paid_at
+            else None
+        ),
+    }
+
+    # --------------------------------------------------------
+    # NOTIFY CUSTOMER OF ORDER STATUS
+    # --------------------------------------------------------
     try:
         await manager.send_to_user(
             order.user_id,
@@ -625,21 +663,71 @@ async def update_order_status(
                 "event": "order_status_updated",
                 "data": {
                     "order_id": order.id,
-                    "status": getattr(
-                        order.status,
-                        "value",
-                        str(order.status),
-                    ),
+                    "status": order_status,
                 },
             },
         )
     except Exception:
         logger.exception(
-            "Failed to notify customer for order %s",
+            "Failed to notify customer of order status for order %s",
             order.id,
         )
 
-    # Notify the admin dashboard if cancellation restored stock.
+    # --------------------------------------------------------
+    # NOTIFY ADMIN OF ORDER STATUS
+    # --------------------------------------------------------
+    try:
+        await manager.send_to_admin({
+            "type": "order_status_updated",
+            "user_id": order.user_id,
+            **payment_data,
+        })
+    except Exception:
+        logger.exception(
+            "Failed to notify admin of order status for order %s",
+            order.id,
+        )
+
+    # --------------------------------------------------------
+    # REAL-TIME COD PAYMENT EVENT
+    # --------------------------------------------------------
+    if (
+        new_status == OrderStatus.DELIVERED
+        and payment is not None
+        and payment.method == PaymentMethod.COD
+        and payment.status == PaymentStatus.PAID
+    ):
+        # Notify the customer.
+        try:
+            await manager.send_to_user(
+                order.user_id,
+                {
+                    "event": "payment_status_updated",
+                    "data": payment_data,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send COD payment update to customer for order %s",
+                order.id,
+            )
+
+        # Notify the admin.
+        try:
+            await manager.send_to_admin({
+                "type": "payment_status_updated",
+                "user_id": order.user_id,
+                **payment_data,
+            })
+        except Exception:
+            logger.exception(
+                "Failed to send COD payment update to admin for order %s",
+                order.id,
+            )
+
+    # --------------------------------------------------------
+    # BROADCAST INVENTORY UPDATE IF CANCELLATION RESTORED STOCK
+    # --------------------------------------------------------
     if inventory_changed:
         try:
             await publish_inventory_updates(

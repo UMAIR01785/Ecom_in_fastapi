@@ -52,3 +52,14 @@ async def admin_order_websocket(
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect_admin(websocket)
+
+@router.websocket("/ws/catalog")
+async def catalog_websocket(websocket: WebSocket):
+    await manager.connect_catalog(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+
+    except WebSocketDisconnect:
+        manager.disconnect_catalog(websocket)

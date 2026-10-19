@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-
+from sqlalchemy import Boolean
 from sqlalchemy import (
     Column,
     DateTime,
@@ -71,6 +71,24 @@ class Refund(Base):
         DateTime,
         nullable=False,
         default=datetime.utcnow,
+    )
+        # When the returned product was received by the store.
+    return_received_at = Column(
+        DateTime,
+        nullable=True,
+    )
+
+    # True = safe to resell; False = damaged/not resellable.
+    # None = return has not been inspected yet.
+    return_restockable = Column(
+        Boolean,
+        nullable=True,
+    )
+
+    # Records when inventory was restocked, preventing duplication.
+    restocked_at = Column(
+        DateTime,
+        nullable=True,
     )
 
     reviewed_at = Column(DateTime, nullable=True)
