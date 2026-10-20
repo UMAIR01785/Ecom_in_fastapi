@@ -9,19 +9,20 @@ from app.models.user import User
 async def get_websocket_user_id(
     websocket: WebSocket,
 ) -> int | None:
-
     token = websocket.query_params.get("token")
 
     if not token:
         return None
 
     try:
-
         payload = jwt.decode(
             token,
             SECRET_KEY,
             algorithms=[ALGORITHM],
         )
+
+        if payload.get("type") != "access":
+            return None
 
         user_id = payload.get("sub")
 
@@ -30,8 +31,7 @@ async def get_websocket_user_id(
 
         return int(user_id)
 
-    except (JWTError, ValueError):
-
+    except (JWTError, TypeError, ValueError):
         return None
 
 
@@ -39,17 +39,17 @@ async def get_websocket_user(
     websocket: WebSocket,
     db: Session,
 ) -> User | None:
-
-    user_id = await get_websocket_user_id(
-        websocket
-    )
+    user_id = await get_websocket_user_id(websocket)
 
     if user_id is None:
         return None
 
     user = (
         db.query(User)
-        .filter(User.id == user_id)
+        .filter(
+            User.id == user_id,
+            User.is_active.is_(True),
+        )
         .first()
     )
 

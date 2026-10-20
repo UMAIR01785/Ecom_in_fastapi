@@ -72,4 +72,4 @@ def create_category_tools(db: Session):
             "slug": category.slug,
         }
 
-    return [list_categories, create_category]
+    return [list_categories]

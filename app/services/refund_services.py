@@ -8,11 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models.order import Order, OrderItem, OrderStatus
-from app.models.product import Product
 from app.models.payment import Payment, PaymentMethod, PaymentStatus
+from app.models.product import Product
 from app.models.refund import Refund, RefundStatus
 from app.models.user import User
-
 from app.services.inventory_service import publish_inventory_updates
 from app.websockets.manager import manager
 
@@ -73,7 +72,7 @@ async def notify_refund_update(
 
 
 # ============================================================
-# CUSTOMER: REQUEST REFUND
+# CUSTOMER: REQUEST A REFUND
 # ============================================================
 
 def request_refund(
@@ -82,7 +81,6 @@ def request_refund(
     order_id: int,
     reason: str,
 ) -> Refund:
-
     order = (
         db.query(Order)
         .filter(
@@ -110,25 +108,33 @@ def request_refund(
     )
 
     if not payment:
-        raise HTTPException(400, "Payment record not found")
+        raise HTTPException(
+            400,
+            "Payment record not found",
+        )
 
-    # Only successfully paid orders may be refunded.
     if payment.status != PaymentStatus.PAID:
         raise HTTPException(
             400,
             "The payment must be marked paid before requesting a refund",
         )
 
-    existing = (
+    existing_refund = (
         db.query(Refund)
         .filter(Refund.order_id == order.id)
         .first()
     )
 
-    if existing:
+    if existing_refund:
         raise HTTPException(
             409,
             "A refund request already exists for this order",
+        )
+
+    if not reason or not reason.strip():
+        raise HTTPException(
+            422,
+            "A refund reason is required",
         )
 
     refund = Refund(
@@ -163,7 +169,6 @@ def list_my_refunds(
     db: Session,
     user: User,
 ) -> list[Refund]:
-
     return (
         db.query(Refund)
         .filter(Refund.requested_by == user.id)
@@ -176,7 +181,9 @@ def list_my_refunds(
 # ADMIN: VIEW ALL REFUNDS
 # ============================================================
 
-def list_refunds(db: Session) -> list[Refund]:
+def list_refunds(
+    db: Session,
+) -> list[Refund]:
     return (
         db.query(Refund)
         .order_by(Refund.requested_at.desc())
@@ -185,8 +192,10 @@ def list_refunds(db: Session) -> list[Refund]:
 
 
 # ============================================================
-# ADMIN: APPROVE OR REJECT REFUND
-# Approval does not mean the money has been returned.
+# ADMIN: APPROVE OR REJECT A REFUND
+#
+# Approval does not itself return money.
+# This function remains synchronous for your existing router.
 # ============================================================
 
 def review_refund(
@@ -196,9 +205,11 @@ def review_refund(
     decision: str,
     admin_note: str | None = None,
 ) -> Refund:
-
     if decision not in {"approve", "reject"}:
-        raise HTTPException(422, "Invalid decision")
+        raise HTTPException(
+            422,
+            "Invalid decision",
+        )
 
     refund = (
         db.query(Refund)
@@ -208,7 +219,10 @@ def review_refund(
     )
 
     if not refund:
-        raise HTTPException(404, "Refund request not found")
+        raise HTTPException(
+            404,
+            "Refund request not found",
+        )
 
     if refund.status != RefundStatus.REQUESTED:
         raise HTTPException(
@@ -231,7 +245,10 @@ def review_refund(
     )
 
     if not order or not payment:
-        raise HTTPException(404, "Order or payment not found")
+        raise HTTPException(
+            404,
+            "Order or payment not found",
+        )
 
     if order.status != OrderStatus.DELIVERED:
         raise HTTPException(
@@ -246,24 +263,44 @@ def review_refund(
     if decision == "reject":
         refund.status = RefundStatus.REJECTED
 
+    else:
+        if payment.status != PaymentStatus.PAID:
+            raise HTTPException(
+                400,
+                "Payment must be paid before refund approval",
+            )
+
+        if payment.method == PaymentMethod.CARD:
+            if (
+                not payment.transaction_id
+                or not payment.transaction_id.startswith("pi_")
+            ):
+                raise HTTPException(
+                    400,
+                    "A valid Stripe PaymentIntent ID is missing",
+                )
+
+        elif payment.method != PaymentMethod.COD:
+            raise HTTPException(
+                400,
+                "Unsupported payment method",
+            )
+
+        refund.status = RefundStatus.APPROVED
+
+    try:
         db.commit()
         db.refresh(refund)
-        return refund
-
-    if payment.status != PaymentStatus.PAID:
-        raise HTTPException(
-            400,
-            "The payment must be marked paid before a refund can be approved",
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Failed to review refund %s",
+            refund_id,
         )
-
-    refund.status = RefundStatus.APPROVED
-
-    # IMPORTANT:
-    # Do not refund money here.
-    # First receive and inspect the returned product.
-
-    db.commit()
-    db.refresh(refund)
+        raise HTTPException(
+            500,
+            "Could not save refund review",
+        )
 
     return refund
 
@@ -272,12 +309,12 @@ def review_refund(
 # ADMIN: RECEIVE AND INSPECT RETURNED PRODUCTS
 #
 # restockable=True:
-#     Product is received and safe to resell.
+#     The returned product is safe to resell.
 #
 # restockable=False:
-#     Product is received but must not return to sellable stock.
+#     The returned product cannot be resold.
 #
-# This implementation supports a FULL-ORDER return only.
+# This function supports full-order refunds.
 # ============================================================
 
 async def receive_return_and_process_refund(
@@ -286,7 +323,6 @@ async def receive_return_and_process_refund(
     refund_id: int,
     restockable: bool,
 ) -> Refund:
-
     refund = (
         db.query(Refund)
         .filter(Refund.id == refund_id)
@@ -295,21 +331,21 @@ async def receive_return_and_process_refund(
     )
 
     if not refund:
-        raise HTTPException(404, "Refund request not found")
+        raise HTTPException(
+            404,
+            "Refund request not found",
+        )
 
-    # Avoid processing the same completed refund a second time.
     if refund.status == RefundStatus.COMPLETED:
         return refund
 
-    # A pending Stripe refund must be reconciled rather than
-    # creating another refund.
     if refund.status == RefundStatus.PROCESSING:
         return refund
 
     if refund.status == RefundStatus.FAILED:
         raise HTTPException(
             409,
-            "Refund previously failed; reconcile its payment before retrying",
+            "Refund previously failed; reconcile Stripe before retrying",
         )
 
     if refund.status != RefundStatus.APPROVED:
@@ -333,7 +369,10 @@ async def receive_return_and_process_refund(
     )
 
     if not order or not payment:
-        raise HTTPException(404, "Order or payment not found")
+        raise HTTPException(
+            404,
+            "Order or payment not found",
+        )
 
     if order.status != OrderStatus.DELIVERED:
         raise HTTPException(
@@ -347,15 +386,39 @@ async def receive_return_and_process_refund(
             "Payment must be paid before refund processing",
         )
 
+    # Validate the card transaction BEFORE recording a return
+    # or modifying inventory.
+    if payment.method == PaymentMethod.CARD:
+        if (
+            not payment.transaction_id
+            or not payment.transaction_id.startswith("pi_")
+        ):
+            raise HTTPException(
+                400,
+                "A valid Stripe PaymentIntent ID is missing",
+            )
+
+    elif payment.method != PaymentMethod.COD:
+        raise HTTPException(
+            400,
+            "Unsupported payment method",
+        )
+
+    # Do not create another Stripe refund if one was already recorded.
+    if payment.method == PaymentMethod.CARD and refund.stripe_refund_id:
+        raise HTTPException(
+            409,
+            "A Stripe refund already exists; reconcile its status",
+        )
+
     now = datetime.utcnow()
     inventory_products: list[Product] = []
 
     # --------------------------------------------------------
-    # RECORD PHYSICAL RETURN AND INSPECTION
+    # RECORD RETURN AND INSPECTION
     # --------------------------------------------------------
 
     if refund.return_received_at is not None:
-        # Do not silently change the inspection result on retries.
         if refund.return_restockable != restockable:
             raise HTTPException(
                 409,
@@ -364,27 +427,29 @@ async def receive_return_and_process_refund(
     else:
         refund.return_received_at = now
         refund.return_restockable = restockable
+        refund.reviewed_by = admin.id
 
     # --------------------------------------------------------
-    # RESTOCK ONLY ONCE, AND ONLY IF SELLABLE
+    # RESTOCK ONLY ONCE
     # --------------------------------------------------------
 
     if restockable and refund.restocked_at is None:
-        order_items = (
+        items = (
             db.query(OrderItem)
             .filter(OrderItem.order_id == order.id)
             .order_by(OrderItem.product_id)
             .all()
         )
 
-        if not order_items:
+        if not items:
             raise HTTPException(
                 400,
                 "No order items found to restock",
             )
 
         product_ids = sorted({
-            item.product_id for item in order_items
+            item.product_id
+            for item in items
         })
 
         products = (
@@ -400,13 +465,13 @@ async def receive_return_and_process_refund(
             for product in products
         }
 
-        for item in order_items:
+        for item in items:
             product = product_map.get(item.product_id)
 
             if product is None:
                 raise HTTPException(
                     400,
-                    f"Product {item.product_id} not found; stock was not restocked",
+                    f"Product {item.product_id} not found",
                 )
 
             product.stock += item.quantity
@@ -414,7 +479,7 @@ async def receive_return_and_process_refund(
         inventory_products = list(product_map.values())
         refund.restocked_at = now
 
-    # Commit the physical return and stock update together.
+    # Save return and inventory together.
     try:
         db.commit()
         db.refresh(refund)
@@ -423,15 +488,15 @@ async def receive_return_and_process_refund(
     except Exception:
         db.rollback()
         logger.exception(
-            "Could not save returned inventory for refund %s",
-            refund.id,
+            "Failed to save return for refund %s",
+            refund_id,
         )
         raise HTTPException(
             500,
             "Could not save return and inventory changes",
         )
 
-    # Notify admin/storefront about stock changes after commit.
+    # Notify inventory subscribers after the commit.
     if inventory_products:
         try:
             await publish_inventory_updates(
@@ -441,44 +506,42 @@ async def receive_return_and_process_refund(
             )
         except Exception:
             logger.exception(
-                "Stock saved but inventory notification failed for refund %s",
-                refund.id,
+                "Inventory was saved but notification failed for refund %s",
+                refund_id,
             )
 
     # --------------------------------------------------------
-    # CARD: INITIATE STRIPE REFUND AFTER RETURN INSPECTION
+    # CARD REFUND: REQUEST STRIPE REFUND
     # --------------------------------------------------------
 
     if payment.method == PaymentMethod.CARD:
-
-        if not payment.transaction_id:
-            raise HTTPException(
-                400,
-                "Stripe PaymentIntent ID is missing",
-            )
-
         try:
             stripe_refund = stripe.Refund.create(
                 payment_intent=payment.transaction_id,
-                amount=int(Decimal(str(refund.amount)) * 100),
+                amount=int(
+                    Decimal(str(refund.amount)) * 100
+                ),
                 reason="requested_by_customer",
                 metadata={
                     "refund_id": str(refund.id),
                     "order_id": str(order.id),
                 },
+                # One Refund record is allowed per order in this model.
+                # Reuse this same key when retrying the same request.
                 idempotency_key=f"refund-order-{order.id}",
             )
+
         except stripe.error.StripeError as exc:
-            # Receipt and any eligible restock have already committed.
-            # The refund remains approved so it can be reconciled.
-            db.rollback()
+            # The return/inventory commit happened already.
+            # Do not pretend money was refunded. A retry should use
+            # the same idempotency key to reconcile the Stripe request.
             logger.exception(
-                "Stripe refund failed for refund %s",
+                "Stripe refund request failed for refund %s",
                 refund.id,
             )
             raise HTTPException(
                 502,
-                "Returned item was recorded, but Stripe could not process the refund",
+                "Return recorded, but Stripe refund could not be confirmed",
             ) from exc
 
         refund.stripe_refund_id = stripe_refund.id
@@ -488,27 +551,49 @@ async def receive_return_and_process_refund(
             refund.completed_at = datetime.utcnow()
             payment.status = PaymentStatus.REFUNDED
 
-        elif stripe_refund.status in ("pending", "requires_action"):
+        elif stripe_refund.status in {
+            "pending",
+            "requires_action",
+        }:
             refund.status = RefundStatus.PROCESSING
 
         else:
             refund.status = RefundStatus.FAILED
 
-        db.commit()
-        db.refresh(refund)
-        db.refresh(payment)
+        try:
+            db.commit()
+            db.refresh(refund)
+            db.refresh(payment)
+        except Exception:
+            db.rollback()
+            logger.exception(
+                "Failed to save Stripe refund result for refund %s",
+                refund.id,
+            )
+            raise HTTPException(
+                500,
+                "Stripe refund was requested, but the result could not be saved",
+            )
 
-        await notify_refund_update(refund, order, payment)
+        await notify_refund_update(
+            refund,
+            order,
+            payment,
+        )
 
         return refund
 
     # --------------------------------------------------------
-    # COD: RECORD RETURN, THEN ADMIN RETURNS MONEY MANUALLY
+    # COD REFUND: MONEY MUST BE RETURNED MANUALLY
     # --------------------------------------------------------
 
-    # Do not mark COD payment as refunded until the admin confirms
-    # that the money has actually been returned to the customer.
-    await notify_refund_update(refund, order, payment)
+    # Do not mark COD refunded here. The admin must first return
+    # the money to the customer and then call complete_cod_refund().
+    await notify_refund_update(
+        refund,
+        order,
+        payment,
+    )
 
     return refund
 
@@ -516,7 +601,7 @@ async def receive_return_and_process_refund(
 # ============================================================
 # ADMIN: COMPLETE COD REFUND
 #
-# Call only after the customer has actually received their money.
+# Call only AFTER the money has actually been returned.
 # ============================================================
 
 async def complete_cod_refund(
@@ -524,7 +609,6 @@ async def complete_cod_refund(
     admin: User,
     refund_id: int,
 ) -> Refund:
-
     refund = (
         db.query(Refund)
         .filter(Refund.id == refund_id)
@@ -533,7 +617,10 @@ async def complete_cod_refund(
     )
 
     if not refund:
-        raise HTTPException(404, "Refund request not found")
+        raise HTTPException(
+            404,
+            "Refund request not found",
+        )
 
     if refund.status != RefundStatus.APPROVED:
         raise HTTPException(
@@ -571,7 +658,10 @@ async def complete_cod_refund(
     )
 
     if not order or not payment:
-        raise HTTPException(404, "Order or payment not found")
+        raise HTTPException(
+            404,
+            "Order or payment not found",
+        )
 
     if payment.method != PaymentMethod.COD:
         raise HTTPException(
@@ -585,17 +675,32 @@ async def complete_cod_refund(
             "COD payment must be paid before it can be refunded",
         )
 
-    # The admin confirms the money has actually been returned.
+    # The admin is confirming the physical/manual money return.
     refund.status = RefundStatus.COMPLETED
     refund.completed_at = datetime.utcnow()
     refund.reviewed_by = admin.id
 
     payment.status = PaymentStatus.REFUNDED
 
-    db.commit()
-    db.refresh(refund)
-    db.refresh(payment)
+    try:
+        db.commit()
+        db.refresh(refund)
+        db.refresh(payment)
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Could not complete COD refund %s",
+            refund_id,
+        )
+        raise HTTPException(
+            500,
+            "Could not save COD refund completion",
+        )
 
-    await notify_refund_update(refund, order, payment)
+    await notify_refund_update(
+        refund,
+        order,
+        payment,
+    )
 
     return refund
