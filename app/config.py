@@ -10,6 +10,8 @@ class Settings(BaseSettings):
 
     secret_key: str
     algorithm: str
+    
+    redis_url: str = "redis://localhost:6379/0"
 
     stripe_secret_key: str
     stripe_webhook_secret: str

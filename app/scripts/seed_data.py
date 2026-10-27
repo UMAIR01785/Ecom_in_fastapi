@@ -2,6 +2,7 @@
 
 Usage:
     python -m app.scripts.seed_data            # seed (skips if data exists)
+    python -m app.scripts.seed_data --products # add products even if some exist
     python -m app.scripts.seed_data --force    # wipe categories/products first
     python -m app.scripts.seed_data --orders   # also seed 10 fake orders
 """
@@ -78,13 +79,13 @@ def seed_categories(db) -> list[Category]:
     return db.query(Category).all()
 
 
-def seed_products(db, categories: list[Category]) -> list[Product]:
+def seed_products(db, categories: list[Category], force: bool = False) -> list[Product]:
     existing_count = db.query(Product).count()
-    if existing_count:
+    if existing_count and not force:
         print(f"Products: {existing_count} already exist - skipping.")
         return db.query(Product).all()
 
-    used_slugs: set = set()
+    used_slugs: set = {slug for (slug,) in db.query(Product.slug).all()}
     total = len(PRODUCT_NOUNS)
     for i, noun in enumerate(PRODUCT_NOUNS):
         name = f"{fake.last_name()} {noun}"
@@ -159,6 +160,11 @@ def main() -> None:
         help="Delete existing categories and products first",
     )
     parser.add_argument(
+        "--products",
+        action="store_true",
+        help="Seed products even if some already exist (keeps existing data)",
+    )
+    parser.add_argument(
         "--orders",
         action="store_true",
         help="Also seed 10 fake orders for existing customers",
@@ -178,7 +184,7 @@ def main() -> None:
                 print(f"Could not clear data (orders may reference products): {e}")
 
         categories = seed_categories(db)
-        seed_products(db, categories)
+        seed_products(db, categories, force=args.products or args.force)
 
         if args.orders:
             seed_orders(db)

@@ -8,8 +8,12 @@ from fastapi import (
     HTTPException,
     UploadFile,
     status,
-)
+    Response,
+)  
 from sqlalchemy.orm import Session
+import json
+
+from app.core.redis import redis_client
 
 from app.core.cloudinary import upload_category_image
 from app.database import get_db
@@ -368,20 +372,40 @@ async def delete_category(
     "/",
     response_model=list[CategoryResponse],
 )
-def get_active_categories(
+async def get_active_categories(
+    response: Response,
     db: Session = Depends(get_db),
 ):
+    cache_key = "categories:active"
+
+    cached_categories = await redis_client.get(cache_key)
+
+    if cached_categories is not None:
+        response.headers["X-Cache"] = "HIT"
+        return json.loads(cached_categories)
 
     categories = (
         db.query(Category)
-        .filter(
-            Category.is_active.is_(True)
-        )
+        .filter(Category.is_active.is_(True))
         .order_by(Category.id.desc())
         .all()
     )
 
-    return categories
+    result = [
+        CategoryResponse.model_validate(category).model_dump(mode="json")
+        for category in categories
+    ]
+
+    await redis_client.set(
+        cache_key,
+        json.dumps(result),
+        ex=600,
+    )
+
+    response.headers["X-Cache"] = "MISS"
+    return result
+
+
 
 
 # ============================================================

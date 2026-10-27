@@ -1,5 +1,8 @@
 
 from app.utils.slug import generate_slug
+import json
+
+from app.core.redis import redis_client
 
 from fastapi import (
     APIRouter,
@@ -9,6 +12,8 @@ from fastapi import (
     HTTPException,
     UploadFile,
     status,
+    
+    Response,
     Query,
 )
 from app.schemas.pagination import PaginatedResponse,PaginationParams
@@ -178,15 +183,24 @@ from app.schemas.product import ProductResponse
 
 
 @router.get("/", response_model=PaginatedResponse[ProductResponse])
-def get_products(
+async def get_products(
+    response: Response,
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=10, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    query = (
-        db.query(Product)
-        .filter(Product.is_active.is_(True))
-    )
+    # Unique cache key for each pagination combination
+    cache_key = f"products:active:page:{page}:limit:{limit}"
+
+    # 1. Check Redis
+    cached_product = await redis_client.get(cache_key)
+
+    if cached_product is not None:
+        response.headers["X-Cache"] = "HIT"
+        return json.loads(cached_product)
+
+    # 2. Query PostgreSQL
+    query = db.query(Product).filter(Product.is_active.is_(True))
 
     total = query.count()
 
@@ -198,15 +212,32 @@ def get_products(
         .all()
     )
 
+    # 3. Serialize each product using the Pydantic response schema
+    items = [
+        ProductResponse.model_validate(product).model_dump(mode="json")
+        for product in products
+    ]
+
     total_pages = ceil(total / limit) if total else 0
 
-    return {
-        "items": products,
+    result = {
+        "items": items,
         "total": total,
         "page": page,
         "limit": limit,
         "total_pages": total_pages,
     }
+
+    # 4. Cache the complete paginated response
+    await redis_client.set(
+        cache_key,
+        json.dumps(result),
+        ex=600,
+    )
+
+    response.headers["X-Cache"] = "MISS"
+    return result
+
 
 
 
