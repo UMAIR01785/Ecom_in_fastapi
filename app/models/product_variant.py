@@ -1,7 +1,8 @@
 
+from __future__ import annotations
 from datetime import datetime
-from decimal import Decimal
 
+from decimal import Decimal
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -28,10 +30,18 @@ class ProductVariant(Base):
             "price IS NULL OR price > 0",
             name="ck_product_variants_price_positive",
         ),
+        UniqueConstraint(
+            "product_id",
+            "size",
+            "color",
+            name="uq_product_variant_size_color",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
-        Integer, primary_key=True, index=True
+        Integer,
+        primary_key=True,
+        index=True,
     )
 
     product_id: Mapped[int] = mapped_column(
@@ -41,32 +51,44 @@ class ProductVariant(Base):
     )
 
     sku: Mapped[str] = mapped_column(
-        String(100), unique=True, nullable=False, index=True
+        String(100),
+        nullable=False,
+        unique=True,
+        index=True,
     )
 
     size: Mapped[str] = mapped_column(
-        String(30), nullable=False
+        String(30),
+        nullable=False,
     )
 
     color: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        String(50),
+        nullable=False,
     )
 
-    # None means use the parent product's price.
+    # None means use Product.price.
     price: Mapped[Decimal | None] = mapped_column(
-        Numeric(10, 2), nullable=True
+        Numeric(10, 2),
+        nullable=True,
     )
 
     stock: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=0
+        Integer,
+        nullable=False,
+        default=0,
     )
 
     is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True
+        Boolean,
+        nullable=False,
+        default=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
@@ -77,5 +99,6 @@ class ProductVariant(Base):
     )
 
     product: Mapped["Product"] = relationship(
-        "Product", back_populates="variants"
+        "Product",
+        back_populates="variants",
     )

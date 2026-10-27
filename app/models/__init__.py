@@ -10,3 +10,4 @@ from app.models.payment import Payment
 from app.models.refresh_token import RefreshToken
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.refund import Refund , RefundStatus
+from app.models.product_variant import ProductVariant

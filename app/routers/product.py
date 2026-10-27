@@ -2,6 +2,17 @@
 from app.utils.slug import generate_slug
 import json
 
+
+from math import ceil
+
+from fastapi import Depends, Query
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.product import Product
+from app.schemas.pagination import PaginatedResponse
+from app.schemas.product import ProductResponse
+
 from app.core.redis import redis_client
 
 from fastapi import (
@@ -151,7 +162,7 @@ async def create_product(
 
 @router.get(
     "/admin/products",
-    response_model=list[ProductResponse],
+    response_model=PaginatedResponse[ProductResponse],
 )
 def get_all_products_admin(
     page: int = Query(1, ge=1),
@@ -159,27 +170,33 @@ def get_all_products_admin(
     db: Session = Depends(get_db),
     current_user=Depends(admin_required),
 ):
+    total = db.query(Product).count()
+
+    offset = (page - 1) * limit
+
     products = (
         db.query(Product)
+        .order_by(Product.id.desc())
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
-    return products
+    total_pages = ceil(total / limit) if total else 0
+
+    return {
+        "items": products,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+    }
+
 
 
 # ============================================================
 # CUSTOMER - GET ACTIVE PRODUCTS
 # ============================================================
-
-from math import ceil
-
-from fastapi import Depends, Query
-from sqlalchemy.orm import Session
-
-from app.database import get_db
-from app.models.product import Product
-from app.schemas.pagination import PaginatedResponse
-from app.schemas.product import ProductResponse
 
 
 @router.get("/", response_model=PaginatedResponse[ProductResponse])

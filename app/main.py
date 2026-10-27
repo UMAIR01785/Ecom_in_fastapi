@@ -12,6 +12,7 @@ from app.routers.admin_user import router as admin_user_router
 from app.routers.admin_oder import router as admin_router
 from app.routers import payment
 from app.routers.admin_reporting import router as admin_reporting_router
+from app.routers.product_variant import router as product_variant_router
 from app.routers.refund import router as refund_router
 from app.routers.admin_chat import router as admin_chat_router
 app = FastAPI(
@@ -22,6 +23,7 @@ app = FastAPI(
 
 app.include_router(admin_reporting_router)
 app.include_router(admin_user_router)
+app.include_router(product_variant_router, prefix="/products")
 app.include_router(websocket_router)
 app.include_router(admin_payment.router)
 app.include_router(auth_router)

@@ -7,6 +7,7 @@ from sqlalchemy import (
     Numeric,
     DateTime,
     ForeignKey,
+    String,
 )
 from sqlalchemy import Enum as sqlenum
 from sqlalchemy.orm import relationship
@@ -166,3 +167,17 @@ class OrderItem(Base):
         "Product",
         back_populates="orders",
     )
+
+    variant_id = Column(
+    Integer,
+    ForeignKey("product_variants.id", ondelete="RESTRICT"),
+    nullable=True,  # Supports existing orders without variants
+    index=True,
+)
+
+    # Snapshot the selected variant for order history.
+    variant_sku = Column(String(100), nullable=True)
+    variant_size = Column(String(50), nullable=True)
+    variant_color = Column(String(100), nullable=True)
+
+    variant = relationship("ProductVariant", foreign_keys=[variant_id], lazy="joined")

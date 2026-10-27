@@ -1,4 +1,6 @@
+
 from datetime import datetime
+
 from decimal import Decimal
 from sqlalchemy import (
     Boolean,
@@ -11,6 +13,7 @@ from sqlalchemy import (
     Column,
     Table,
 )
+
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.cart import CartItem
 from app.database import Base
@@ -117,11 +120,22 @@ class Product(Base):
         secondary=product_categories,
         back_populates="products",
     )
+
+
+
+    variants: Mapped[list["ProductVariant"]] = relationship(
+    "ProductVariant",
+    back_populates="product",
+    cascade="all, delete-orphan",
+)
+
     
     
     cart_items: Mapped[list["CartItem"]] = relationship(
     "CartItem",
     back_populates="product"
+
+
 )
 
     @property

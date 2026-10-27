@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime, timedelta
+from app.models.product_variant import ProductVariant
 from decimal import Decimal
 
 from fastapi import HTTPException
@@ -46,6 +47,33 @@ def get_order_products(db: Session, order_id: int) -> list[Product]:
         db.query(Product)
         .filter(Product.id.in_(product_ids))
         .order_by(Product.id)
+        .all()
+    )
+
+
+
+def get_order_variants(db: Session, order_id: int) -> list[ProductVariant]:
+    """Return variants referenced by this order for inventory notifications."""
+    variant_ids = sorted({
+        row[0]
+        for row in (
+            db.query(OrderItem.variant_id)
+            .filter(
+                OrderItem.order_id == order_id,
+                OrderItem.variant_id.isnot(None),
+            )
+            .all()
+        )
+        if row[0] is not None
+    })
+
+    if not variant_ids:
+        return []
+
+    return (
+        db.query(ProductVariant)
+        .filter(ProductVariant.id.in_(variant_ids))
+        .order_by(ProductVariant.id)
         .all()
     )
 
@@ -114,9 +142,24 @@ async def checkout_cart(
             for product in products
         }
 
+        # Lock all variants for these products in a consistent order.
+        # This also lets us reject a cart item that has no selected variant
+        # when the product is sold in sizes/colors.
+        variants = (
+            db.query(ProductVariant)
+            .filter(ProductVariant.product_id.in_(product_ids))
+            .order_by(ProductVariant.id)
+            .with_for_update()
+            .all()
+        )
+        variant_map = {variant.id: variant for variant in variants}
+        variants_by_product = {}
+        for variant in variants:
+            variants_by_product.setdefault(variant.product_id, []).append(variant)
+
         total_amount = Decimal("0.00")
 
-        # Validate products and calculate the order total.
+        # Validate products/variants and calculate the final order total.
         for item in cart_items:
             product = product_map.get(item.product_id)
 
@@ -138,13 +181,38 @@ async def checkout_cart(
                     detail="Invalid cart quantity",
                 )
 
-            if product.stock < item.quantity:
+            variant = None
+            if item.variant_id is not None:
+                variant = variant_map.get(item.variant_id)
+                if variant is None or variant.product_id != product.id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Selected variant for '{product.name}' is invalid",
+                    )
+                if not variant.is_active:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Selected size/color for '{product.name}' is unavailable",
+                    )
+            elif variants_by_product.get(product.id):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Select a size and color for '{product.name}'",
+                )
+
+            available_stock = variant.stock if variant is not None else product.stock
+            if available_stock < item.quantity:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Not enough stock for '{product.name}'",
                 )
 
-            total_amount += product.price * item.quantity
+            unit_price = (
+                Decimal(str(variant.price))
+                if variant is not None and variant.price is not None
+                else Decimal(str(product.price))
+            )
+            total_amount += unit_price * item.quantity
 
         # Keep your existing minimum amount rule for card payments.
         if (
@@ -195,20 +263,35 @@ async def checkout_cart(
             )
         )
 
-        # Create order items and reserve inventory.
+        # Create order items and reserve the selected variant's inventory.
+        changed_variants = []
         for item in cart_items:
             product = product_map[item.product_id]
+            variant = variant_map.get(item.variant_id) if item.variant_id is not None else None
+            unit_price = (
+                Decimal(str(variant.price))
+                if variant is not None and variant.price is not None
+                else Decimal(str(product.price))
+            )
 
             db.add(
                 OrderItem(
                     order_id=order.id,
                     product_id=product.id,
+                    variant_id=variant.id if variant is not None else None,
+                    variant_sku=variant.sku if variant is not None else None,
+                    variant_size=variant.size if variant is not None else None,
+                    variant_color=variant.color if variant is not None else None,
                     quantity=item.quantity,
-                    unit_price=product.price,
+                    unit_price=unit_price,
                 )
             )
 
-            product.stock -= item.quantity
+            if variant is not None:
+                variant.stock -= item.quantity
+                changed_variants.append(variant)
+            else:
+                product.stock -= item.quantity
 
         # Create the payment record.
         payment = Payment(
@@ -257,6 +340,7 @@ async def checkout_cart(
     try:
         await publish_inventory_updates(
             products,
+            variants=changed_variants,
             reason="order_placed",
             order_id=order.id,
         )
@@ -318,9 +402,8 @@ def release_order_inventory(
         .all()
     )
 
-    product_ids = sorted({
-        item.product_id for item in items
-    })
+    product_ids = sorted({item.product_id for item in items})
+    variant_ids = sorted({item.variant_id for item in items if item.variant_id is not None})
 
     products = (
         db.query(Product)
@@ -329,22 +412,36 @@ def release_order_inventory(
         .with_for_update()
         .all()
     )
+    product_map = {product.id: product for product in products}
 
-    product_map = {
-        product.id: product
-        for product in products
-    }
+    variants = (
+        db.query(ProductVariant)
+        .filter(ProductVariant.id.in_(variant_ids))
+        .order_by(ProductVariant.id)
+        .with_for_update()
+        .all()
+        if variant_ids
+        else []
+    )
+    variant_map = {variant.id: variant for variant in variants}
 
     for item in items:
-        product = product_map.get(item.product_id)
-
-        if product is None:
-            raise RuntimeError(
-                f"Product {item.product_id} is missing "
-                f"while releasing order {order.id}"
-            )
-
-        product.stock += item.quantity
+        if item.variant_id is not None:
+            variant = variant_map.get(item.variant_id)
+            if variant is None:
+                raise RuntimeError(
+                    f"Variant {item.variant_id} is missing "
+                    f"while releasing order {order.id}"
+                )
+            variant.stock += item.quantity
+        else:
+            product = product_map.get(item.product_id)
+            if product is None:
+                raise RuntimeError(
+                    f"Product {item.product_id} is missing "
+                    f"while releasing order {order.id}"
+                )
+            product.stock += item.quantity
 
     # Record release in the same transaction as the stock update.
     order.inventory_released_at = datetime.utcnow()
@@ -362,6 +459,7 @@ async def cancel_order(
     order_id: int,
 ):
     inventory_products = []
+    inventory_variants = []
     inventory_changed = False
 
     try:
@@ -408,6 +506,7 @@ async def cancel_order(
 
         if inventory_changed:
             inventory_products = get_order_products(db, order.id)
+            inventory_variants = get_order_variants(db, order.id)
 
         order.status = OrderStatus.CANCELLED
 
@@ -439,6 +538,7 @@ async def cancel_order(
         if inventory_changed:
             await publish_inventory_updates(
                 inventory_products,
+                variants=inventory_variants,
                 reason="order_cancelled",
                 order_id=order.id,
             )
@@ -488,6 +588,7 @@ async def update_order_status(
     new_status: OrderStatus,
 ):
     inventory_products = []
+    inventory_variants = []
     inventory_changed = False
 
     try:
@@ -558,6 +659,7 @@ async def update_order_status(
 
             if inventory_changed:
                 inventory_products = get_order_products(db, order.id)
+                inventory_variants = get_order_variants(db, order.id)
 
         # ----------------------------------------------------
         # COD PAYMENT UPDATE ON DELIVERY
@@ -732,6 +834,7 @@ async def update_order_status(
         try:
             await publish_inventory_updates(
                 inventory_products,
+                variants=inventory_variants,
                 reason="order_cancelled",
                 order_id=order.id,
             )

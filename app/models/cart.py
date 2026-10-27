@@ -9,6 +9,7 @@ from app.database import Base
 if TYPE_CHECKING:
     from app.models.user import User
     from app.models.product import Product
+    from app.models.product_variant import ProductVariant
 
 class Cart(Base):
     __tablename__ = "carts"
@@ -41,43 +42,51 @@ class Cart(Base):
         back_populates="cart"
     )
 
-
 class CartItem(Base):
     __tablename__ = "cart_items"
 
     id: Mapped[int] = mapped_column(
         primary_key=True,
-        index=True
+        index=True,
     )
 
     cart_id: Mapped[int] = mapped_column(
         ForeignKey("carts.id", ondelete="CASCADE"),
-        nullable=False
+        nullable=False,
     )
 
     product_id: Mapped[int] = mapped_column(
         ForeignKey("products.id", ondelete="CASCADE"),
-        nullable=False
+        nullable=False,
+    )
+
+    variant_id: Mapped[int | None] = mapped_column(
+        ForeignKey("product_variants.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     quantity: Mapped[int] = mapped_column(
         nullable=False,
-        default=1
+        default=1,
     )
 
     cart: Mapped["Cart"] = relationship(
         "Cart",
-        back_populates="items"
+        back_populates="items",
     )
 
-    product: Mapped["Product"] = relationship(
-        "Product"
+    product: Mapped["Product"] = relationship("Product")
+
+    variant: Mapped["ProductVariant | None"] = relationship(
+        "ProductVariant",
     )
 
     __table_args__ = (
         UniqueConstraint(
             "cart_id",
             "product_id",
-            name="uq_cart_product"
+            "variant_id",
+            name="uq_cart_product_variant",
         ),
     )
