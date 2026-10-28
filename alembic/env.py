@@ -10,6 +10,8 @@ from app.models.order import Order, OrderItem
 from app.models.refund import Refund
 from app.models.order_address import OrderAddress
 from app.models.product_variant import ProductVariant
+from app.models.invertory_lots import InventoryLot
+from app.models.orderitem_lot import OrderItemLot   
 from logging.config import fileConfig
 import os
 from dotenv import load_dotenv

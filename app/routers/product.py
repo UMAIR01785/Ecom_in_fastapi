@@ -577,6 +577,7 @@ def delete_product(
     # --------------------------------------------------------
 
     product.is_active = False
+    
 
     db.commit()
 

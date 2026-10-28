@@ -88,6 +88,11 @@ class OrderItemResponse(BaseModel):
     product_name: str | None = None
     product_image: str | None = None
 
+    variant_id: int | None = None
+    variant_sku: str | None = None
+    variant_size: str | None = None
+    variant_color: str | None = None
+
     model_config = ConfigDict(
         from_attributes=True,
     )
@@ -109,6 +114,10 @@ class OrderItemResponse(BaseModel):
                 "unit_price": data.unit_price,
                 "product_name": product.name,
                 "product_image": product.image,
+                "variant_id": getattr(data, "variant_id", None),
+                "variant_sku": getattr(data, "variant_sku", None),
+                "variant_size": getattr(data, "variant_size", None),
+                "variant_color": getattr(data, "variant_color", None),
             }
 
         return data

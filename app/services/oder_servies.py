@@ -12,6 +12,10 @@ from app.models.order_address import OrderAddress
 from app.models.payment import Payment, PaymentMethod, PaymentStatus
 from app.models.product import Product
 from app.models.user import User
+from sqlalchemy import or_
+
+from app.models.invertory_lots import InventoryLot
+from app.models.orderitem_lot import OrderItemLot
 
 from app.schemas.oder import CheckoutRequest
 
@@ -76,6 +80,89 @@ def get_order_variants(db: Session, order_id: int) -> list[ProductVariant]:
         .order_by(ProductVariant.id)
         .all()
     )
+
+
+def consume_inventory_lots(
+    db: Session,
+    order_item: OrderItem,
+    product_id: int,
+    variant_id: int | None,
+    quantity: int,
+) -> None:
+    """
+    Deduct stock from inventory lots and record the allocation.
+
+    FEFO: earliest expiry first.
+    Lots without an expiry date are used after dated lots.
+    Expired and depleted lots are excluded.
+
+    The caller must commit or roll back the surrounding transaction.
+    """
+
+    now = datetime.utcnow()
+
+    query = db.query(InventoryLot).filter(
+        InventoryLot.quantity_remaining > 0,
+        or_(
+            InventoryLot.expires_at.is_(None),
+            InventoryLot.expires_at > now,
+        ),
+    )
+
+    if variant_id is not None:
+        query = query.filter(
+            InventoryLot.variant_id == variant_id,
+            InventoryLot.product_id.is_(None),
+        )
+    else:
+        query = query.filter(
+            InventoryLot.product_id == product_id,
+            InventoryLot.variant_id.is_(None),
+        )
+
+    lots = (
+        query
+        .order_by(
+            InventoryLot.expires_at.asc().nullslast(),
+            InventoryLot.received_at.asc(),
+            InventoryLot.id.asc(),
+        )
+        .with_for_update()
+        .all()
+    )
+
+    available = sum(lot.quantity_remaining for lot in lots)
+
+    if available < quantity:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Insufficient eligible inventory lots for "
+                f"product {product_id}"
+            ),
+        )
+
+    remaining = quantity
+
+    for lot in lots:
+        if remaining == 0:
+            break
+
+        deducted = min(lot.quantity_remaining, remaining)
+
+        lot.quantity_remaining -= deducted
+
+        allocation = OrderItemLot(
+            order_item_id=order_item.id,
+            inventory_lot_id=lot.id,
+            quantity=deducted,
+        )
+
+        db.add(allocation)
+        remaining -= deducted
+
+    db.flush()
+
 
 
 # ============================================================
@@ -263,35 +350,55 @@ async def checkout_cart(
             )
         )
 
-        # Create order items and reserve the selected variant's inventory.
+        
+        # Create order items, consume lots, and update aggregate stock.
         changed_variants = []
+
         for item in cart_items:
             product = product_map[item.product_id]
-            variant = variant_map.get(item.variant_id) if item.variant_id is not None else None
+
+            variant = (
+                variant_map.get(item.variant_id)
+                if item.variant_id is not None
+                else None
+            )
+
             unit_price = (
                 Decimal(str(variant.price))
                 if variant is not None and variant.price is not None
                 else Decimal(str(product.price))
             )
 
-            db.add(
-                OrderItem(
-                    order_id=order.id,
-                    product_id=product.id,
-                    variant_id=variant.id if variant is not None else None,
-                    variant_sku=variant.sku if variant is not None else None,
-                    variant_size=variant.size if variant is not None else None,
-                    variant_color=variant.color if variant is not None else None,
-                    quantity=item.quantity,
-                    unit_price=unit_price,
-                )
+            order_item = OrderItem(
+                order_id=order.id,
+                product_id=product.id,
+                variant_id=variant.id if variant is not None else None,
+                variant_sku=variant.sku if variant is not None else None,
+                variant_size=variant.size if variant is not None else None,
+                variant_color=variant.color if variant is not None else None,
+                quantity=item.quantity,
+                unit_price=unit_price,
             )
 
+            db.add(order_item)
+            db.flush()
+
+            # Consume the exact lots that supply this order item.
+            consume_inventory_lots(
+                db=db,
+                order_item=order_item,
+                product_id=product.id,
+                variant_id=variant.id if variant is not None else None,
+                quantity=item.quantity,
+            )
+
+            # Maintain the existing aggregate stock fields.
             if variant is not None:
                 variant.stock -= item.quantity
                 changed_variants.append(variant)
             else:
                 product.stock -= item.quantity
+
 
         # Create the payment record.
         payment = Payment(
@@ -377,33 +484,37 @@ async def checkout_cart(
 # RELEASE ORDER INVENTORY
 # ============================================================
 
+
 def release_order_inventory(
     db: Session,
     order: Order,
 ) -> bool:
     """
-    Restore inventory only when it was deducted and has not
-    already been released.
+    Restore aggregate stock and the exact lots consumed by an order.
 
     The caller must lock the order before calling this function.
+    The caller is responsible for committing the transaction.
     """
 
     if order.inventory_released_at is not None:
         return False
 
-    # Do not guess for old orders whose inventory state is unknown.
     if order.inventory_deducted_at is None:
         return False
 
     items = (
         db.query(OrderItem)
         .filter(OrderItem.order_id == order.id)
-        .order_by(OrderItem.product_id)
+        .order_by(OrderItem.product_id, OrderItem.id)
         .all()
     )
 
     product_ids = sorted({item.product_id for item in items})
-    variant_ids = sorted({item.variant_id for item in items if item.variant_id is not None})
+    variant_ids = sorted({
+        item.variant_id
+        for item in items
+        if item.variant_id is not None
+    })
 
     products = (
         db.query(Product)
@@ -411,6 +522,7 @@ def release_order_inventory(
         .order_by(Product.id)
         .with_for_update()
         .all()
+        if product_ids else []
     )
     product_map = {product.id: product for product in products}
 
@@ -420,34 +532,99 @@ def release_order_inventory(
         .order_by(ProductVariant.id)
         .with_for_update()
         .all()
-        if variant_ids
-        else []
+        if variant_ids else []
     )
     variant_map = {variant.id: variant for variant in variants}
 
+    # Load all allocations for this order.
+    allocations = (
+        db.query(OrderItemLot)
+        .join(OrderItem, OrderItem.id == OrderItemLot.order_item_id)
+        .filter(OrderItem.order_id == order.id)
+        .order_by(
+            OrderItemLot.inventory_lot_id,
+            OrderItemLot.id,
+        )
+        .all()
+    )
+
+    allocations_by_item = {}
+    for allocation in allocations:
+        allocations_by_item.setdefault(
+            allocation.order_item_id, []
+        ).append(allocation)
+
+    # Lock the referenced lots before restoring quantities.
+    lot_ids = sorted({
+        allocation.inventory_lot_id
+        for allocation in allocations
+    })
+
+    lots = (
+        db.query(InventoryLot)
+        .filter(InventoryLot.id.in_(lot_ids))
+        .order_by(InventoryLot.id)
+        .with_for_update()
+        .all()
+        if lot_ids else []
+    )
+    lot_map = {lot.id: lot for lot in lots}
+
     for item in items:
+        item_allocations = allocations_by_item.get(item.id, [])
+
+        # A newly lot-tracked order must have allocations that add up
+        # to the order-item quantity. Do not silently restore incorrect
+        # inventory if allocation records are missing or incomplete.
+        allocated_quantity = sum(
+            allocation.quantity for allocation in item_allocations
+        )
+
+        if allocated_quantity != item.quantity:
+            raise RuntimeError(
+                f"Order {order.id}, item {item.id}: expected "
+                f"{item.quantity} allocated units, found "
+                f"{allocated_quantity}. Inventory was not released."
+            )
+
+        for allocation in item_allocations:
+            lot = lot_map.get(allocation.inventory_lot_id)
+
+            if lot is None:
+                raise RuntimeError(
+                    f"Inventory lot {allocation.inventory_lot_id} "
+                    f"is missing for order {order.id}"
+                )
+
+            lot.quantity_remaining += allocation.quantity
+
+        # Restore the aggregate product or variant stock.
         if item.variant_id is not None:
             variant = variant_map.get(item.variant_id)
+
             if variant is None:
                 raise RuntimeError(
                     f"Variant {item.variant_id} is missing "
                     f"while releasing order {order.id}"
                 )
+
             variant.stock += item.quantity
+
         else:
             product = product_map.get(item.product_id)
+
             if product is None:
                 raise RuntimeError(
                     f"Product {item.product_id} is missing "
                     f"while releasing order {order.id}"
                 )
+
             product.stock += item.quantity
 
-    # Record release in the same transaction as the stock update.
     order.inventory_released_at = datetime.utcnow()
+    db.flush()
 
     return True
-
 
 # ============================================================
 # CANCEL ORDER

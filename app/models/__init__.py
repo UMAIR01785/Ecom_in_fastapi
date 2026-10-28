@@ -11,3 +11,5 @@ from app.models.refresh_token import RefreshToken
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.refund import Refund , RefundStatus
 from app.models.product_variant import ProductVariant
+from app.models.orderitem_lot import OrderItemLot
+from app.models.invertory_lots import InventoryLot
