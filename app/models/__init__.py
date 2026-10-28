@@ -13,3 +13,7 @@ from app.models.refund import Refund , RefundStatus
 from app.models.product_variant import ProductVariant
 from app.models.orderitem_lot import OrderItemLot
 from app.models.invertory_lots import InventoryLot
+from app.models.shopping_chat import (
+    ShoppingChatConversation,
+    ShoppingChatMessage,
+)

@@ -15,12 +15,15 @@ from app.routers.admin_reporting import router as admin_reporting_router
 from app.routers.product_variant import router as product_variant_router
 from app.routers.refund import router as refund_router
 from app.routers.admin_chat import router as admin_chat_router
+from app.routers.shopping_chat import router as shopping_chat_router
 from app.routers import inventory_lots
 app = FastAPI(
     title="E-Commerce API",
     description="Backend API for an e-commerce platform",
     version="1.0.0"
 )
+
+app.include_router(shopping_chat_router)
 app.include_router(inventory_lots.router)
 app.include_router(admin_reporting_router)
 app.include_router(admin_user_router)
