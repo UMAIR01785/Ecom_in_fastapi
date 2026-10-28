@@ -1,7 +1,7 @@
 
 from datetime import datetime
 from decimal import Decimal
-
+from .oder import CheckoutRequest
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -67,3 +67,11 @@ class ShoppingChatResponse(BaseModel):
     messages: list[ShoppingChatMessageResponse] = Field(
         default_factory=list
     )
+
+class ShoppingChatCheckoutRequest(BaseModel):
+    """Checkout request submitted after customer confirmation."""
+
+    confirmed: bool = Field(
+        description="Must be true when the customer confirms the order."
+    )
+    checkout: CheckoutRequest

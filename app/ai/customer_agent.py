@@ -27,6 +27,7 @@ SHOPPING_TOOL_NAMES = {
     "get_cart",
     "update_cart_item",
     "remove_from_cart",
+    "prepare_checkout",
 }
 
 

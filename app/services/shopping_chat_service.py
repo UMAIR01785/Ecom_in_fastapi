@@ -9,6 +9,10 @@ from app.models.shopping_chat import (
     ShoppingChatConversation,
     ShoppingChatMessage,
 )
+from app.services.cart import (
+    get_or_create_guest_cart,
+    get_or_create_user_cart,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +27,7 @@ def send_shopping_message(
     content: str,
     user_id: int | None,
     guest_session_id: str | None,
+    guest_cart_id: str | None = None,
     conversation_id: int | None = None,
 ) -> dict:
     content = content.strip()
@@ -33,7 +38,7 @@ def send_shopping_message(
     if user_id is None and not guest_session_id:
         raise ValueError("A guest session is required")
 
-    # Only retrieve a conversation belonging to this customer/session.
+    # Retrieve only a conversation owned by this user or guest session.
     conversation = None
 
     if conversation_id is not None:
@@ -59,6 +64,7 @@ def send_shopping_message(
 
     now = datetime.now(timezone.utc)
 
+    # Save the customer's message.
     try:
         if conversation is None:
             conversation = ShoppingChatConversation(
@@ -100,13 +106,21 @@ def send_shopping_message(
     )
     history.reverse()
 
-    # Generate an answer and structured product cards.
+    # Resolve the correct cart for the current customer.
     try:
+        if user_id is not None:
+            cart = get_or_create_user_cart(db, user_id)
+        elif guest_cart_id:
+            cart = get_or_create_guest_cart(db, guest_cart_id)
+        else:
+            cart = None
+
+        # Generate the AI reply and structured product cards.
         reply, products = run_customer_agent(
-    db=db,
-    history=history,
-    cart=cart,
-)
+            db=db,
+            history=history,
+            cart=cart,
+        )
 
         if not reply or not reply.strip():
             raise ValueError("The AI returned an empty reply")
@@ -117,6 +131,7 @@ def send_shopping_message(
             "The shopping assistant is temporarily unavailable."
         ) from exc
 
+    # Save the assistant's reply.
     assistant_message = ShoppingChatMessage(
         conversation_id=conversation.id,
         role="assistant",
@@ -128,6 +143,7 @@ def send_shopping_message(
         conversation.updated_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(assistant_message)
+
     except Exception:
         db.rollback()
         logger.exception("Failed to save shopping assistant reply")
