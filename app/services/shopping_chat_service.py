@@ -1,10 +1,10 @@
-
 import logging
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.ai.customer_agent import run_customer_agent
+from app.models.user import User
 from app.models.shopping_chat import (
     ShoppingChatConversation,
     ShoppingChatMessage,
@@ -29,6 +29,8 @@ def send_shopping_message(
     guest_session_id: str | None,
     guest_cart_id: str | None = None,
     conversation_id: int | None = None,
+    current_user: User | None = None,
+    confirmation_authorized: bool = False,
 ) -> dict:
     content = content.strip()
 
@@ -37,6 +39,17 @@ def send_shopping_message(
 
     if user_id is None and not guest_session_id:
         raise ValueError("A guest session is required")
+
+    # Ensure the authenticated user and user_id agree.
+    if current_user is not None and current_user.id != user_id:
+        raise ValueError("Authenticated user does not match user_id")
+
+    if user_id is not None and current_user is None:
+        raise ValueError("Authenticated user is required")
+
+    # Guests must never be allowed to place orders through the agent.
+    if current_user is None:
+        confirmation_authorized = False
 
     # Retrieve only a conversation owned by this user or guest session.
     conversation = None
@@ -120,6 +133,8 @@ def send_shopping_message(
             db=db,
             history=history,
             cart=cart,
+            current_user=current_user,
+            confirmation_authorized=confirmation_authorized,
         )
 
         if not reply or not reply.strip():

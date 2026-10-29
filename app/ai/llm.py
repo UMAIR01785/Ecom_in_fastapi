@@ -1,16 +1,16 @@
 
-from langchain_groq import ChatGroq
+from langchain_openrouter import ChatOpenRouter
 
 from app.config import settings
 
 
-def get_llm() -> ChatGroq:
-    if not settings.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is not configured")
+def get_llm() -> ChatOpenRouter:
+    if not settings.openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
 
-    return ChatGroq(
-        model="openai/gpt-oss-20b",
+    return ChatOpenRouter(
+        model="openrouter/free",
         temperature=0,
-        api_key=settings.groq_api_key,
+        api_key=settings.openrouter_api_key,
         max_retries=1,
     )

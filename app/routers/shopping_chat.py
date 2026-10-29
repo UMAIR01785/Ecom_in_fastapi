@@ -1,7 +1,7 @@
 
 import logging
 from uuid import uuid4
-from app.services.oder_servies import checkout_cart
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -11,10 +11,12 @@ from fastapi import (
     status,
 )
 from sqlalchemy.orm import Session
-from app.schemas.oder import CheckoutResponse
+
+from app.services.oder_servies import checkout_cart
 from app.database import get_db
 from app.dependencies.auth import get_optional_current_user
 from app.models.user import User
+from app.schemas.oder import CheckoutResponse
 from app.schemas.shopping_chat import (
     ShoppingChatMessageRequest,
     ShoppingChatResponse,
@@ -84,6 +86,13 @@ def send_message(
             guest_session_id=guest_session_id,
             guest_cart_id=guest_cart_id,
             conversation_id=data.conversation_id,
+
+            # NEW: pass the trusted authenticated user.
+            current_user=current_user,
+
+            # Keep false until backend confirmation-state
+            # validation is implemented.
+            confirmation_authorized=False,
         )
 
     except ValueError as exc:
@@ -111,6 +120,7 @@ def send_message(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process shopping message",
         ) from exc
+
 
 @router.post(
     "/checkout",

@@ -1,4 +1,5 @@
 
+import asyncio
 from decimal import Decimal
 import logging
 
@@ -6,8 +7,10 @@ from fastapi import HTTPException
 from langchain_core.tools import tool
 from sqlalchemy.orm import Session
 from app.schemas.oder import CheckoutRequest
+from app.services.oder_servies import checkout_cart
 
 from app.models.cart import Cart
+from app.models.user import User
 from app.services.cart import (
     add_to_cart as cart_add_to_cart,
     calculate_subtotal,
@@ -30,6 +33,8 @@ MAX_QUANTITY = 20
 def create_customer_product_tools(
     db: Session,
     cart: Cart | None = None,
+    current_user: User | None = None,
+    confirmation_authorized: bool = False,
 ):
     """Create shopping tools for the current customer's trusted cart."""
 
@@ -326,84 +331,8 @@ def create_customer_product_tools(
                 "success": False,
                 "message": "Could not remove the cart item.",
             }
-    @tool
-    def prepare_checkout(
-        full_name: str,
-        phone_number: str,
-        address_line1: str,
-        city: str,
-        country: str,
-        payment_method: str,
-        address_line2: str | None = None,
-        state: str | None = None,
-        postal_code: str | None = None,
-        landmark: str | None = None,
-    ) -> dict:
-        """Prepare checkout after collecting the customer's delivery
-        address and payment method. This tool does not place an order.
-        Ask the customer to review the cart and confirm before checkout."""
-
-        if cart is None:
-            return {
-                "success": False,
-                "message": "Cart is unavailable.",
-            }
-
-        current_cart = refresh_cart()
-
-        if current_cart is None or not current_cart.items:
-            return {
-                "success": False,
-                "message": "Your cart is empty. Add shoes before checkout.",
-            }
-
-        method = payment_method.strip().upper()
-
-        if method not in {"CARD", "COD"}:
-            return {
-                "success": False,
-                "message": "Choose CARD or COD as the payment method.",
-            }
-
-        try:
-            checkout_data = CheckoutRequest.model_validate({
-                "order_address": {
-                    "full_name": full_name,
-                    "phone_number": phone_number,
-                    "address_line1": address_line1,
-                    "address_line2": address_line2,
-                    "city": city,
-                    "state": state,
-                    "postal_code": postal_code,
-                    "country": country,
-                    "landmark": landmark,
-                },
-                "payment_method": method,
-            })
-        except Exception as exc:
-            return {
-                "success": False,
-                "message": f"Invalid checkout details: {exc}",
-            }
-
-        cart_summary = serialize_cart(current_cart)
-
-        return {
-            "success": True,
-            "ready_for_confirmation": True,
-            "message": (
-                "Checkout details prepared. Show the customer the cart "
-                "items, subtotal, delivery address, and payment method. "
-                "Ask for explicit confirmation. Do not claim the order "
-                "has been placed."
-            ),
-            "cart": cart_summary,
-            "shipping_address": (
-                checkout_data.order_address.model_dump()
-            ),
-            "payment_method": checkout_data.payment_method.value,
-        }
-
+   
+    
     return [
         search_shoes,
         get_product_details,
@@ -411,5 +340,4 @@ def create_customer_product_tools(
         get_cart,
         update_cart_item,
         remove_from_cart,
-        prepare_checkout,
     ]

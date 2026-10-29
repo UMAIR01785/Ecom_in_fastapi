@@ -18,6 +18,8 @@ class Settings(BaseSettings):
 
     # For your AI chatbot
     groq_api_key: str | None = None
+    # For your AI chatbot
+    openrouter_api_key: str | None = None
 
     # False for local HTTP development; True for HTTPS production
     refresh_cookie_secure: bool = False

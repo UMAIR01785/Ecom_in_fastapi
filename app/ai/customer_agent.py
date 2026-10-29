@@ -27,27 +27,37 @@ SHOPPING_TOOL_NAMES = {
     "get_cart",
     "update_cart_item",
     "remove_from_cart",
-    "prepare_checkout",
 }
-
 
 def run_customer_agent(
     db: Session,
     history: list,
     cart=None,
+    current_user=None,
+    confirmation_authorized: bool = False,
 ) -> tuple[str, list[dict]]:
     """
     Run the customer shopping agent.
 
-    Returns:
-        A tuple containing the assistant's reply and product cards.
+    Args:
+        db: Database session.
+        history: Recent messages for this conversation.
+        cart: Cart resolved by the backend.
+        current_user: Authenticated user resolved by FastAPI.
+        confirmation_authorized: Must be verified by the backend,
+            not decided by the LLM.
 
-    Note:
-        The cart must be resolved by the FastAPI endpoint using
-        trusted authenticated-customer or guest-cart context.
+    Returns:
+        Assistant reply and structured product cards.
     """
 
-    tools = create_customer_product_tools(db, cart=cart)
+    tools = create_customer_product_tools(
+        db=db,
+        cart=cart,
+        current_user=current_user,
+        confirmation_authorized=confirmation_authorized,
+    )
+
     tools_by_name = {tool.name: tool for tool in tools}
 
     messages = [get_customer_system_message()]
@@ -55,14 +65,18 @@ def run_customer_agent(
     # Restore recent conversation context.
     for message in history[-MAX_HISTORY_MESSAGES:]:
         if message.role == "user":
-            messages.append(HumanMessage(content=message.content))
+            messages.append(
+                HumanMessage(content=message.content)
+            )
 
         elif message.role == "assistant":
-            messages.append(AIMessage(content=message.content))
+            messages.append(
+                AIMessage(content=message.content)
+            )
 
     llm_with_tools = get_llm().bind_tools(tools)
 
-    # Product cards to return to the frontend.
+    # Product cards returned to the frontend.
     found_products: dict[int, dict] = {}
 
     for _ in range(MAX_TOOL_ROUNDS):
@@ -100,10 +114,38 @@ def run_customer_agent(
             tool_call_id = tool_call["id"]
             tool = tools_by_name.get(tool_name)
 
-            if tool is None or tool_name not in SHOPPING_TOOL_NAMES:
+            if (
+                tool is None
+                or tool_name not in SHOPPING_TOOL_NAMES
+            ):
                 result = {
                     "success": False,
                     "error": "Requested tool is unavailable.",
+                }
+
+            elif (
+                tool_name == "place_order"
+                and not confirmation_authorized
+            ):
+                # Do not allow the model to authorize its own checkout.
+                result = {
+                    "success": False,
+                    "message": (
+                        "Order confirmation has not been authorized "
+                        "by the backend. Ask the customer to confirm "
+                        "the checkout summary."
+                    ),
+                }
+
+            elif (
+                tool_name == "place_order"
+                and current_user is None
+            ):
+                result = {
+                    "success": False,
+                    "message": (
+                        "Please log in before placing an order."
+                    ),
                 }
 
             else:
@@ -116,7 +158,7 @@ def run_customer_agent(
                             "error": "Tool returned an unexpected result.",
                         }
 
-                    # Collect product cards from product searches.
+                    # Collect product cards from searches.
                     if (
                         tool_name == "search_shoes"
                         and not result.get("error")
@@ -127,7 +169,7 @@ def run_customer_agent(
                             if product_id is not None:
                                 found_products[product_id] = product
 
-                    # Also collect a product returned by detail lookup.
+                    # Collect product cards from detail lookup.
                     elif tool_name == "get_product_details":
                         product = result.get("product")
 
@@ -152,8 +194,7 @@ def run_customer_agent(
                         ),
                     }
 
-            # Return each tool result to the model so it can formulate
-            # the next response based on the actual operation result.
+            # Give the actual tool result back to the model.
             messages.append(
                 ToolMessage(
                     content=json.dumps(result, default=str),
