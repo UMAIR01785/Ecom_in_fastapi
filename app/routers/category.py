@@ -1,5 +1,6 @@
-from app.utils.slug import generate_slug
-from app.websockets.manager import manager
+
+import json
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -9,12 +10,13 @@ from fastapi import (
     UploadFile,
     status,
     Response,
-)  
-from sqlalchemy.orm import Session
-import json
+)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.utils.slug import generate_slug
+from app.websockets.manager import manager
 from app.core.redis import redis_client
-
 from app.core.cloudinary import upload_category_image
 from app.database import get_db
 from app.dependencies.permissions import admin_required
@@ -29,49 +31,32 @@ router = APIRouter(
 )
 
 
-
-
-
 # ============================================================
 # ADMIN ROUTES
 # ============================================================
 
 
-# ============================================================
-# Get ALL Categories
-# Admin Only
-#
-# Returns both:
-# - Active categories
-# - Inactive categories
-# ============================================================
-
-
+# Get ALL Categories - Admin Only
 @router.get(
     "/admin/all",
     response_model=list[CategoryResponse],
 )
-def get_all_categories(
-    db: Session = Depends(get_db),
+async def get_all_categories(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(admin_required),
 ):
-    categories = (
-        db.query(Category)
-        .order_by(Category.id.desc())
-        .all()
+    result = await db.execute(
+        select(Category).order_by(Category.id.desc())
     )
+
+    categories = result.scalars().all()
 
     return categories
 
 
 # ============================================================
-# Create Category
-# Admin Only
-#
-# Request type:
-# multipart/form-data
+# Create Category - Admin Only
 # ============================================================
-
 
 @router.post(
     "/admin",
@@ -83,13 +68,8 @@ async def create_category(
     description: str | None = Form(None),
     image: UploadFile | None = File(None),
     current_user: User = Depends(admin_required),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # Clean category name
-    # --------------------------------------------------------
-
     name = name.strip()
 
     if not name:
@@ -97,10 +77,6 @@ async def create_category(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Category name cannot be empty",
         )
-
-    # --------------------------------------------------------
-    # Generate slug
-    # --------------------------------------------------------
 
     slug = generate_slug(name)
 
@@ -110,18 +86,15 @@ async def create_category(
             detail="Invalid category name",
         )
 
-    # --------------------------------------------------------
     # Check duplicate category
-    # --------------------------------------------------------
-
-    existing_category = (
-        db.query(Category)
-        .filter(
+    result = await db.execute(
+        select(Category).where(
             (Category.name == name)
             | (Category.slug == slug)
         )
-        .first()
     )
+
+    existing_category = result.scalar_one_or_none()
 
     if existing_category:
         raise HTTPException(
@@ -129,19 +102,13 @@ async def create_category(
             detail="Category name or slug already exists",
         )
 
-    # --------------------------------------------------------
     # Upload image
-    # --------------------------------------------------------
-
     image_url = None
 
     if image:
         image_url = await upload_category_image(image)
 
-    # --------------------------------------------------------
     # Create category
-    # --------------------------------------------------------
-
     category = Category(
         name=name,
         slug=slug,
@@ -150,31 +117,30 @@ async def create_category(
     )
 
     db.add(category)
-    db.commit()
-    db.refresh(category)
+
+    try:
+        await db.commit()
+        await db.refresh(category)
+    except Exception:
+        await db.rollback()
+        raise
+
+    # Clear cached active categories
+    await redis_client.delete("categories:active")
 
     await manager.broadcast_to_catalog({
-    "type": "catalog_updated",
-    "entity": "category",
-    "action": "created",
-    "id": category.id,
-})
+        "type": "catalog_updated",
+        "entity": "category",
+        "action": "created",
+        "id": category.id,
+    })
+
+    return category
 
 
 # ============================================================
-# Update Category
-# Admin Only
-#
-# URL:
-# PATCH /categories/admin/{slug}
-#
-# Admin can update:
-# - name
-# - description
-# - is_active
-# - image
+# Update Category - Admin Only
 # ============================================================
-
 
 @router.patch(
     "/admin/{slug}",
@@ -187,23 +153,14 @@ async def update_category(
     is_active: bool | None = Form(None),
     image: UploadFile | None = File(None),
     current_user: User = Depends(admin_required),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # Find category using slug
-    #
-    # IMPORTANT:
-    # Do NOT filter by is_active here.
-    #
-    # Admin must be able to edit inactive categories too.
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == slug)
-        .first()
+    # Find category, including inactive categories
+    result = await db.execute(
+        select(Category).where(Category.slug == slug)
     )
+
+    category = result.scalar_one_or_none()
 
     if not category:
         raise HTTPException(
@@ -211,12 +168,8 @@ async def update_category(
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
     # Update name and slug
-    # --------------------------------------------------------
-
     if name is not None:
-
         name = name.strip()
 
         if not name:
@@ -233,22 +186,18 @@ async def update_category(
                 detail="Invalid category name",
             )
 
-        # ----------------------------------------------------
-        # Check whether another category already
-        # has this name or slug
-        # ----------------------------------------------------
-
-        existing_category = (
-            db.query(Category)
-            .filter(
+        # Check whether another category has this name or slug
+        result = await db.execute(
+            select(Category).where(
                 Category.id != category.id,
                 (
                     (Category.name == name)
                     | (Category.slug == new_slug)
                 ),
             )
-            .first()
         )
+
+        existing_category = result.scalar_one_or_none()
 
         if existing_category:
             raise HTTPException(
@@ -259,52 +208,42 @@ async def update_category(
         category.name = name
         category.slug = new_slug
 
-    # --------------------------------------------------------
     # Update description
-    # --------------------------------------------------------
-
     if description is not None:
         category.description = description
 
-    # --------------------------------------------------------
     # Update active status
-    # --------------------------------------------------------
-
     if is_active is not None:
         category.is_active = is_active
 
-    # --------------------------------------------------------
     # Update image
-    # --------------------------------------------------------
-
     if image:
         image_url = await upload_category_image(image)
-
         category.image = image_url
 
-    # --------------------------------------------------------
-    # Save changes
-    # --------------------------------------------------------
+    try:
+        await db.commit()
+        await db.refresh(category)
+    except Exception:
+        await db.rollback()
+        raise
 
-    db.commit()
-    db.refresh(category)
+    # Clear cached active categories
+    await redis_client.delete("categories:active")
 
     await manager.broadcast_to_catalog({
-    "type": "catalog_updated",
-    "entity": "category",
-    "action": "updated",
-    "id": category.id,
-})
+        "type": "catalog_updated",
+        "entity": "category",
+        "action": "updated",
+        "id": category.id,
+    })
+
+    return category
 
 
 # ============================================================
-# Delete Category
-# Admin Only
-#
-# URL:
-# DELETE /categories/admin/{slug}
+# Delete Category - Admin Only
 # ============================================================
-
 
 @router.delete(
     "/admin/{slug}",
@@ -313,18 +252,13 @@ async def update_category(
 async def delete_category(
     slug: str,
     current_user: User = Depends(admin_required),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-
-    # --------------------------------------------------------
-    # Find category using slug
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == slug)
-        .first()
+    result = await db.execute(
+        select(Category).where(Category.slug == slug)
     )
+
+    category = result.scalar_one_or_none()
 
     if not category:
         raise HTTPException(
@@ -332,14 +266,17 @@ async def delete_category(
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
-    # Delete category
-    # --------------------------------------------------------
-
     category_id = category.id
 
-    db.delete(category)
-    db.commit()
+    try:
+        await db.delete(category)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # Clear cached active categories
+    await redis_client.delete("categories:active")
 
     await manager.broadcast_to_catalog({
         "type": "catalog_updated",
@@ -348,7 +285,7 @@ async def delete_category(
         "id": category_id,
     })
 
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ============================================================
@@ -356,25 +293,14 @@ async def delete_category(
 # ============================================================
 
 
-# ============================================================
 # Get All Active Categories
-#
-# Public:
-# - Non-authenticated users
-# - Customers
-# - Admins
-#
-# Only active categories are returned.
-# ============================================================
-
-
 @router.get(
     "/",
     response_model=list[CategoryResponse],
 )
 async def get_active_categories(
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     cache_key = "categories:active"
 
@@ -384,62 +310,50 @@ async def get_active_categories(
         response.headers["X-Cache"] = "HIT"
         return json.loads(cached_categories)
 
-    categories = (
-        db.query(Category)
-        .filter(Category.is_active.is_(True))
+    result = await db.execute(
+        select(Category)
+        .where(Category.is_active.is_(True))
         .order_by(Category.id.desc())
-        .all()
     )
 
-    result = [
+    categories = result.scalars().all()
+
+    result_data = [
         CategoryResponse.model_validate(category).model_dump(mode="json")
         for category in categories
     ]
 
     await redis_client.set(
         cache_key,
-        json.dumps(result),
+        json.dumps(result_data),
         ex=600,
     )
 
     response.headers["X-Cache"] = "MISS"
-    return result
 
-
+    return result_data
 
 
 # ============================================================
 # Get Single Active Category
-#
-# Public:
-# - Non-authenticated users
-# - Customers
-# - Admins
-#
-# URL:
-# GET /categories/{slug}
-#
-# Inactive categories return 404.
 # ============================================================
-
 
 @router.get(
     "/{slug}",
     response_model=CategoryResponse,
 )
-def get_active_category(
+async def get_active_category(
     slug: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-
-    category = (
-        db.query(Category)
-        .filter(
+    result = await db.execute(
+        select(Category).where(
             Category.slug == slug,
             Category.is_active.is_(True),
         )
-        .first()
     )
+
+    category = result.scalar_one_or_none()
 
     if not category:
         raise HTTPException(

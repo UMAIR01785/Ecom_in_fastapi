@@ -1,19 +1,6 @@
-
-from app.utils.slug import generate_slug
 import json
-
-
+from decimal import Decimal
 from math import ceil
-
-from fastapi import Depends, Query
-from sqlalchemy.orm import Session
-
-from app.database import get_db
-from app.models.product import Product
-from app.schemas.pagination import PaginatedResponse
-from app.schemas.product import ProductResponse
-
-from app.core.redis import redis_client
 
 from fastapi import (
     APIRouter,
@@ -21,27 +8,90 @@ from fastapi import (
     File,
     Form,
     HTTPException,
-    UploadFile,
-    status,
-    
     Response,
+    UploadFile,
     Query,
+    status,
 )
-from app.schemas.pagination import PaginatedResponse,PaginationParams
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.cloudinary import upload_product_image
+from app.core.redis import redis_client
 from app.database import get_db
 from app.dependencies.permissions import admin_required
 from app.models.category import Category
 from app.models.product import Product
+from app.schemas.pagination import PaginatedResponse
 from app.schemas.product import ProductResponse
+from app.utils.slug import generate_slug
 
 
 router = APIRouter(
     prefix="",
     tags=["Products"],
 )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+async def invalidate_active_products_cache() -> None:
+    """
+    Remove every cached active-product pagination response.
+
+    Cache keys currently follow:
+        products:active:page:{page}:limit:{limit}
+    """
+    async for key in redis_client.scan_iter(
+        match="products:active:*",
+        count=100,
+    ):
+        await redis_client.delete(key)
+
+
+async def get_categories_by_slugs(
+    db: AsyncSession,
+    category_slugs: list[str],
+) -> list[Category]:
+    """
+    Fetch categories in one async query and preserve the submitted
+    order. Duplicate slugs are normalized before validation.
+    """
+    unique_slugs = list(dict.fromkeys(category_slugs))
+
+    result = await db.execute(
+        select(Category).where(Category.slug.in_(unique_slugs))
+    )
+    categories = result.scalars().all()
+
+    categories_by_slug = {
+        category.slug: category
+        for category in categories
+    }
+
+    if len(categories_by_slug) != len(unique_slugs):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="One or more categories not found",
+        )
+
+    return [categories_by_slug[slug] for slug in unique_slugs]
+
+
+async def get_product_with_categories(
+    db: AsyncSession,
+    product_id: int,
+) -> Product | None:
+    """Reload a product with categories eagerly loaded for Pydantic."""
+    result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .where(Product.id == product_id)
+    )
+    return result.scalar_one_or_none()
 
 
 # ============================================================
@@ -55,85 +105,52 @@ router = APIRouter(
 )
 async def create_product(
     name: str = Form(...),
-    description: str = Form(None),
-    price: float = Form(...),
+    description: str | None = Form(None),
+    price: Decimal = Form(...),
     stock: int = Form(...),
-
-    # Multiple category slugs
     category_slugs: list[str] = Form(...),
-
     is_active: bool = Form(True),
     image: UploadFile | None = File(None),
-
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    # --------------------------------------------------------
-    # Find categories
-    # --------------------------------------------------------
-
-    categories = (
-        db.query(Category)
-        .filter(Category.slug.in_(category_slugs))
-        .all()
-    )
-
-    if len(categories) != len(category_slugs):
+    if price <= 0:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="One or more categories not found",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Price must be greater than zero",
         )
 
-    # --------------------------------------------------------
-    # Check duplicate product name
-    # --------------------------------------------------------
+    if stock < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Stock cannot be negative",
+        )
 
-    existing_product = (
-        db.query(Product)
-        .filter(Product.name == name)
-        .first()
+    categories = await get_categories_by_slugs(db, category_slugs)
+
+    existing_name_result = await db.execute(
+        select(Product.id).where(Product.name == name).limit(1)
     )
-
-    if existing_product:
+    if existing_name_result.scalar_one_or_none() is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Product with this name already exists",
         )
 
-    # --------------------------------------------------------
-    # Generate product slug
-    # --------------------------------------------------------
-
     slug = generate_slug(name)
 
-    # --------------------------------------------------------
-    # Check duplicate slug
-    # --------------------------------------------------------
-
-    existing_slug = (
-        db.query(Product)
-        .filter(Product.slug == slug)
-        .first()
+    existing_slug_result = await db.execute(
+        select(Product.id).where(Product.slug == slug).limit(1)
     )
-
-    if existing_slug:
+    if existing_slug_result.scalar_one_or_none() is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Product with this slug already exists",
         )
 
-    # --------------------------------------------------------
-    # Upload image
-    # --------------------------------------------------------
-
     image_url = None
-
-    if image:
+    if image is not None:
         image_url = await upload_product_image(image)
-
-    # --------------------------------------------------------
-    # Create product
-    # --------------------------------------------------------
 
     product = Product(
         name=name,
@@ -143,44 +160,54 @@ async def create_product(
         stock=stock,
         image=image_url,
         is_active=is_active,
-
-        # Many-to-many relationship
         categories=categories,
     )
 
-    db.add(product)
-    db.commit()
-    db.refresh(product)
+    product_id = product.id
 
-    return product
+    try:
+        db.add(product)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    # Re-query with categories loaded. This avoids async lazy-loading
+    # when ProductResponse reads Product.category_slugs.
+    saved_product = await get_product_with_categories(db, product_id)
+    await invalidate_active_products_cache()
+
+    return saved_product
 
 
 # ============================================================
 # ADMIN - GET ALL PRODUCTS
-# Shows active + inactive products
+# Includes active and inactive products.
 # ============================================================
 
 @router.get(
     "/admin/products",
     response_model=PaginatedResponse[ProductResponse],
 )
-def get_all_products_admin(
+async def get_all_products_admin(
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    total = db.query(Product).count()
-
-    offset = (page - 1) * limit
-
-    products = (
-        db.query(Product)
-        .order_by(Product.id.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
+    total_result = await db.execute(
+        select(func.count()).select_from(Product)
     )
+    total = total_result.scalar_one()
+
+    products_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .order_by(Product.id.desc())
+        .offset((page - 1) * limit)
+        .limit(limit)
+    )
+    products = products_result.scalars().all()
 
     total_pages = ceil(total / limit) if total else 0
 
@@ -193,43 +220,49 @@ def get_all_products_admin(
     }
 
 
-
 # ============================================================
 # CUSTOMER - GET ACTIVE PRODUCTS
 # ============================================================
 
-
-@router.get("/", response_model=PaginatedResponse[ProductResponse])
+@router.get(
+    "/",
+    response_model=PaginatedResponse[ProductResponse],
+)
 async def get_products(
     response: Response,
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=10, ge=1, le=100),
-    db: Session = Depends(get_db),
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
 ):
-    # Unique cache key for each pagination combination
     cache_key = f"products:active:page:{page}:limit:{limit}"
 
-    # 1. Check Redis
-    cached_product = await redis_client.get(cache_key)
+    cached_products = await redis_client.get(cache_key)
 
-    if cached_product is not None:
+    if cached_products is not None:
         response.headers["X-Cache"] = "HIT"
-        return json.loads(cached_product)
+        if isinstance(cached_products, bytes):
+            cached_products = cached_products.decode("utf-8")
+        return json.loads(cached_products)
 
-    # 2. Query PostgreSQL
-    query = db.query(Product).filter(Product.is_active.is_(True))
+    filters = Product.is_active.is_(True)
 
-    total = query.count()
+    total_result = await db.execute(
+        select(func.count())
+        .select_from(Product)
+        .where(filters)
+    )
+    total = total_result.scalar_one()
 
-    products = (
-        query
+    products_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .where(filters)
         .order_by(Product.id)
         .offset((page - 1) * limit)
         .limit(limit)
-        .all()
     )
+    products = products_result.scalars().all()
 
-    # 3. Serialize each product using the Pydantic response schema
     items = [
         ProductResponse.model_validate(product).model_dump(mode="json")
         for product in products
@@ -245,7 +278,6 @@ async def get_products(
         "total_pages": total_pages,
     }
 
-    # 4. Cache the complete paginated response
     await redis_client.set(
         cache_key,
         json.dumps(result),
@@ -254,8 +286,6 @@ async def get_products(
 
     response.headers["X-Cache"] = "MISS"
     return result
-
-
 
 
 # ============================================================
@@ -267,94 +297,71 @@ async def get_products(
     "/{category_slug}",
     response_model=list[ProductResponse],
 )
-def get_products_by_category(
+async def get_products_by_category(
     category_slug: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    # --------------------------------------------------------
-    # Find category
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == category_slug)
-        .first()
+    category_result = await db.execute(
+        select(Category.id).where(Category.slug == category_slug)
     )
+    category_id = category_result.scalar_one_or_none()
 
-    if not category:
+    if category_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
-    # Get active products belonging to this category
-    # --------------------------------------------------------
-
-    products = (
-        db.query(Product)
-        .filter(
-            Product.categories.any(
-                Category.id == category.id
-            ),
-            Product.is_active == True,
+    products_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .where(
+            Product.categories.any(Category.id == category_id),
+            Product.is_active.is_(True),
         )
-        .all()
+        .order_by(Product.id)
     )
 
-    return products
+    return products_result.scalars().all()
 
 
 # ============================================================
 # CUSTOMER - GET SINGLE PRODUCT
-# Example:
-# GET /shoes/nike-air-max
+# Example: GET /shoes/nike-air-max
 # ============================================================
 
 @router.get(
     "/{category_slug}/{product_slug}",
     response_model=ProductResponse,
 )
-def get_product(
+async def get_product(
     category_slug: str,
     product_slug: str,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    # --------------------------------------------------------
-    # Find category
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == category_slug)
-        .first()
+    category_result = await db.execute(
+        select(Category.id).where(Category.slug == category_slug)
     )
+    category_id = category_result.scalar_one_or_none()
 
-    if not category:
+    if category_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
-    # Find product inside category
-    # --------------------------------------------------------
-
-    product = (
-        db.query(Product)
-        .filter(
+    product_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .where(
             Product.slug == product_slug,
-
-            Product.categories.any(
-                Category.id == category.id
-            ),
-
-            Product.is_active == True,
+            Product.categories.any(Category.id == category_id),
+            Product.is_active.is_(True),
         )
-        .first()
     )
+    product = product_result.scalar_one_or_none()
 
-    if not product:
+    if product is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found in this category",
@@ -365,8 +372,7 @@ def get_product(
 
 # ============================================================
 # UPDATE PRODUCT
-# Example:
-# PUT /shoes/nike-air-max
+# Example: PUT /shoes/nike-air-max
 # ============================================================
 
 @router.put(
@@ -376,77 +382,65 @@ def get_product(
 async def update_product(
     category_slug: str,
     product_slug: str,
-
     name: str | None = Form(None),
     description: str | None = Form(None),
-    price: float | None = Form(None),
+    price: Decimal | None = Form(None),
     stock: int | None = Form(None),
     is_active: bool | None = Form(None),
-
-    # Replace product categories
     category_slugs: list[str] | None = Form(None),
-
     image: UploadFile | None = File(None),
-
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    # --------------------------------------------------------
-    # Find current category
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == category_slug)
-        .first()
+    category_result = await db.execute(
+        select(Category.id).where(Category.slug == category_slug)
     )
+    category_id = category_result.scalar_one_or_none()
 
-    if not category:
+    if category_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
-    # Find product inside current category
-    # --------------------------------------------------------
-
-    product = (
-        db.query(Product)
-        .filter(
+    product_result = await db.execute(
+        select(Product)
+        .options(selectinload(Product.categories))
+        .where(
             Product.slug == product_slug,
-
-            Product.categories.any(
-                Category.id == category.id
-            ),
+            Product.categories.any(Category.id == category_id),
         )
-        .first()
     )
+    product = product_result.scalar_one_or_none()
 
-    if not product:
+    if product is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found in this category",
         )
 
-    # --------------------------------------------------------
-    # Update name + slug
-    # --------------------------------------------------------
-
-    if name is not None:
-
-        new_slug = generate_slug(name)
-
-        existing_product = (
-            db.query(Product)
-            .filter(
-                Product.slug == new_slug,
-                Product.id != product.id,
-            )
-            .first()
+    if price is not None and price <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Price must be greater than zero",
         )
 
-        if existing_product:
+    if stock is not None and stock < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Stock cannot be negative",
+        )
+
+    if name is not None:
+        new_slug = generate_slug(name)
+
+        duplicate_result = await db.execute(
+            select(Product.id).where(
+                Product.slug == new_slug,
+                Product.id != product.id,
+            ).limit(1)
+        )
+        if duplicate_result.scalar_one_or_none() is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Another product already uses this name",
@@ -455,133 +449,93 @@ async def update_product(
         product.name = name
         product.slug = new_slug
 
-    # --------------------------------------------------------
-    # Update description
-    # --------------------------------------------------------
-
     if description is not None:
         product.description = description
-
-    # --------------------------------------------------------
-    # Update price
-    # --------------------------------------------------------
 
     if price is not None:
         product.price = price
 
-    # --------------------------------------------------------
-    # Update stock
-    # --------------------------------------------------------
-
+    # NOTE: This preserves the existing endpoint's direct stock update.
+    # With inventory lots enabled, stock changes should instead be routed
+    # through the inventory service so Product.stock and lot quantities
+    # remain consistent.
     if stock is not None:
         product.stock = stock
-
-    # --------------------------------------------------------
-    # Update active status
-    # --------------------------------------------------------
 
     if is_active is not None:
         product.is_active = is_active
 
-    # --------------------------------------------------------
-    # Update categories
-    # --------------------------------------------------------
-
     if category_slugs is not None:
-
-        categories = (
-            db.query(Category)
-            .filter(Category.slug.in_(category_slugs))
-            .all()
-        )
-
-        if len(categories) != len(category_slugs):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="One or more categories not found",
-            )
-
-        # Replace existing categories
+        categories = await get_categories_by_slugs(db, category_slugs)
         product.categories = categories
 
-    # --------------------------------------------------------
-    # Update image
-    # --------------------------------------------------------
-
-    if image:
+    if image is not None:
         product.image = await upload_product_image(image)
 
-    db.commit()
-    db.refresh(product)
+    product_id = product.id
 
-    return product
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    updated_product = await get_product_with_categories(db, product_id)
+    await invalidate_active_products_cache()
+
+    return updated_product
 
 
 # ============================================================
-# DELETE PRODUCT
-# Example:
-# DELETE /shoes/nike-air-max
+# DELETE PRODUCT (SOFT DELETE)
+# Example: DELETE /shoes/nike-air-max
 # ============================================================
 
 @router.delete(
     "/{category_slug}/{product_slug}",
     status_code=status.HTTP_200_OK,
 )
-def delete_product(
+async def delete_product(
     category_slug: str,
     product_slug: str,
-
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    # --------------------------------------------------------
-    # Find category
-    # --------------------------------------------------------
-
-    category = (
-        db.query(Category)
-        .filter(Category.slug == category_slug)
-        .first()
+    category_result = await db.execute(
+        select(Category.id).where(Category.slug == category_slug)
     )
+    category_id = category_result.scalar_one_or_none()
 
-    if not category:
+    if category_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Category not found",
         )
 
-    # --------------------------------------------------------
-    # Find product
-    # --------------------------------------------------------
-
-    product = (
-        db.query(Product)
-        .filter(
+    product_result = await db.execute(
+        select(Product).where(
             Product.slug == product_slug,
-
-            Product.categories.any(
-                Category.id == category.id
-            ),
+            Product.categories.any(Category.id == category_id),
         )
-        .first()
     )
+    product = product_result.scalar_one_or_none()
 
-    if not product:
+    if product is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found in this category",
         )
 
-    # --------------------------------------------------------
-    # Soft delete
-    # --------------------------------------------------------
-
     product.is_active = False
-    
 
-    db.commit()
+    try:
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    await invalidate_active_products_cache()
 
     return {
         "message": "Product deleted successfully"
     }
-

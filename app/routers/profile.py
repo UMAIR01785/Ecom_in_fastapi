@@ -1,6 +1,9 @@
 
 from fastapi import APIRouter, Depends, HTTPException, File, UploadFile
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
+from starlette.concurrency import run_in_threadpool
 
 from app.database import get_db
 from app.models.user import User
@@ -28,15 +31,17 @@ router = APIRouter(
 # ============================================================
 
 @router.get("", response_model=ProfileResponse)
-def get_profile(
+async def get_profile(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == current_user.id)
-        .first()
+    result = await db.execute(
+        select(Profile)
+        .options(joinedload(Profile.user))
+        .where(Profile.user_id == current_user.id)
     )
+
+    profile = result.scalar_one_or_none()
 
     if not profile:
         raise HTTPException(
@@ -69,16 +74,18 @@ def get_profile(
 # ============================================================
 
 @router.patch("/update", response_model=ProfileResponse)
-def update_profile(
+async def update_profile(
     data: ProfileUpdate,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == current_user.id)
-        .first()
+    result = await db.execute(
+        select(Profile).where(
+            Profile.user_id == current_user.id
+        )
     )
+
+    profile = result.scalar_one_or_none()
 
     if not profile:
         raise HTTPException(
@@ -110,10 +117,10 @@ def update_profile(
         elif field in profile_fields:
             setattr(profile, field, value)
 
-    db.commit()
+    await db.commit()
 
-    db.refresh(current_user)
-    db.refresh(profile)
+    await db.refresh(current_user)
+    await db.refresh(profile)
 
     return {
         "id": profile.id,
@@ -143,13 +150,15 @@ def update_profile(
 async def upload_image(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == current_user.id)
-        .first()
+    result = await db.execute(
+        select(Profile).where(
+            Profile.user_id == current_user.id
+        )
     )
+
+    profile = result.scalar_one_or_none()
 
     if not profile:
         raise HTTPException(
@@ -187,19 +196,22 @@ async def upload_image(
     old_public_id = profile.profile_picture_public_id
 
     try:
-        # Upload new image to Cloudinary
-        image = upload_profile_image(contents)
+        # Upload new image to Cloudinary without blocking event loop
+        image = await run_in_threadpool(
+            upload_profile_image,
+            contents
+        )
 
         # Save new Cloudinary information
         profile.profile_picture = image["url"]
         profile.profile_picture_public_id = image["public_id"]
 
         # Save changes to database
-        db.commit()
-        db.refresh(profile)
+        await db.commit()
+        await db.refresh(profile)
 
     except Exception:
-        db.rollback()
+        await db.rollback()
 
         raise HTTPException(
             status_code=500,
@@ -209,7 +221,10 @@ async def upload_image(
     # Delete old image after successful upload + database update
     if old_public_id:
         try:
-            delete_profile_image(old_public_id)
+            await run_in_threadpool(
+                delete_profile_image,
+                old_public_id
+            )
         except Exception:
             pass
 
@@ -223,15 +238,17 @@ async def upload_image(
 # ============================================================
 
 @router.delete("/image")
-def delete_image(
+async def delete_image(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    profile = (
-        db.query(Profile)
-        .filter(Profile.user_id == current_user.id)
-        .first()
+    result = await db.execute(
+        select(Profile).where(
+            Profile.user_id == current_user.id
+        )
     )
+
+    profile = result.scalar_one_or_none()
 
     if not profile:
         raise HTTPException(
@@ -246,8 +263,9 @@ def delete_image(
         )
 
     try:
-        # Delete image from Cloudinary
-        delete_profile_image(
+        # Delete image from Cloudinary without blocking event loop
+        await run_in_threadpool(
+            delete_profile_image,
             profile.profile_picture_public_id
         )
 
@@ -255,10 +273,10 @@ def delete_image(
         profile.profile_picture = None
         profile.profile_picture_public_id = None
 
-        db.commit()
+        await db.commit()
 
     except Exception:
-        db.rollback()
+        await db.rollback()
 
         raise HTTPException(
             status_code=500,

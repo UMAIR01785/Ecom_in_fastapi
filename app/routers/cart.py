@@ -2,7 +2,7 @@
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.user import User
@@ -33,6 +33,10 @@ router = APIRouter(prefix="/cart", tags=["Cart"])
 
 GUEST_CART_COOKIE = "guest_cart_id"
 
+
+# ============================================================
+# BUILD CART RESPONSE
+# ============================================================
 
 def build_cart_response(cart):
     items = []
@@ -85,13 +89,17 @@ def build_cart_response(cart):
     }
 
 
-def get_request_cart(
+# ============================================================
+# GET REQUEST CART
+# ============================================================
+
+async def get_request_cart(
     request: Request,
-    db: Session,
+    db: AsyncSession,
     current_user: User | None,
 ):
     if current_user:
-        cart = get_cart_by_user_id(
+        cart = await get_cart_by_user_id(
             db=db,
             user_id=current_user.id,
         )
@@ -104,7 +112,7 @@ def get_request_cart(
                 detail="Cart not found",
             )
 
-        cart = get_cart_by_guest_id(
+        cart = await get_cart_by_guest_id(
             db=db,
             guest_id=guest_id,
         )
@@ -118,16 +126,20 @@ def get_request_cart(
     return cart
 
 
+# ============================================================
+# ADD ITEM TO CART
+# ============================================================
+
 @router.post("/items", response_model=CartResponse)
-def add_item(
+async def add_item(
     item: CartItemCreate,
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
     if current_user:
-        cart = get_or_create_user_cart(
+        cart = await get_or_create_user_cart(
             db=db,
             user_id=current_user.id,
         )
@@ -146,12 +158,12 @@ def add_item(
                 max_age=60 * 60 * 24 * 30,
             )
 
-        cart = get_or_create_guest_cart(
+        cart = await get_or_create_guest_cart(
             db=db,
             guest_id=guest_id,
         )
 
-    cart = add_to_cart(
+    cart = await add_to_cart(
         db=db,
         cart=cart,
         product_id=item.product_id,
@@ -162,30 +174,47 @@ def add_item(
     return build_cart_response(cart)
 
 
+# ============================================================
+# GET CART
+# ============================================================
+
 @router.get("", response_model=CartResponse)
-def get_cart(
+async def get_cart(
     request: Request,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
-    cart = get_request_cart(request, db, current_user)
+    cart = await get_request_cart(
+        request=request,
+        db=db,
+        current_user=current_user,
+    )
+
     return build_cart_response(cart)
 
+
+# ============================================================
+# UPDATE CART ITEM
+# ============================================================
 
 @router.patch(
     "/items/{cart_item_id}",
     response_model=CartResponse,
 )
-def update_item(
+async def update_item(
     cart_item_id: int,
     item: CartItemUpdate,
     request: Request,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
-    cart = get_request_cart(request, db, current_user)
+    cart = await get_request_cart(
+        request=request,
+        db=db,
+        current_user=current_user,
+    )
 
-    cart = update_cart_item(
+    cart = await update_cart_item(
         db=db,
         cart=cart,
         cart_item_id=cart_item_id,
@@ -195,19 +224,27 @@ def update_item(
     return build_cart_response(cart)
 
 
+# ============================================================
+# REMOVE CART ITEM
+# ============================================================
+
 @router.delete(
     "/items/{cart_item_id}",
     response_model=CartResponse,
 )
-def remove_item(
+async def remove_item(
     cart_item_id: int,
     request: Request,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
-    cart = get_request_cart(request, db, current_user)
+    cart = await get_request_cart(
+        request=request,
+        db=db,
+        current_user=current_user,
+    )
 
-    cart = remove_from_cart(
+    cart = await remove_from_cart(
         db=db,
         cart=cart,
         cart_item_id=cart_item_id,
@@ -216,15 +253,19 @@ def remove_item(
     return build_cart_response(cart)
 
 
+# ============================================================
+# CLEAR CART
+# ============================================================
+
 @router.delete("")
-def delete_cart(
+async def delete_cart(
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
     if current_user:
-        cart = get_cart_by_user_id(
+        cart = await get_cart_by_user_id(
             db=db,
             user_id=current_user.id,
         )
@@ -234,13 +275,16 @@ def delete_cart(
         if not guest_id:
             return {"message": "Cart already empty"}
 
-        cart = get_cart_by_guest_id(
+        cart = await get_cart_by_guest_id(
             db=db,
             guest_id=guest_id,
         )
 
     if cart:
-        clear_cart(db=db, cart=cart)
+        await clear_cart(
+            db=db,
+            cart=cart,
+        )
 
     if not current_user:
         response.delete_cookie(key=GUEST_CART_COOKIE)
@@ -248,37 +292,47 @@ def delete_cart(
     return {"message": "Cart cleared successfully"}
 
 
+# ============================================================
+# MERGE GUEST CART INTO USER CART
+# ============================================================
+
 @router.post("/merge", response_model=CartResponse)
-def merge_cart(
+async def merge_cart(
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     guest_id = request.cookies.get(GUEST_CART_COOKIE)
 
-    user_cart = get_or_create_user_cart(
+    user_cart = await get_or_create_user_cart(
         db=db,
         user_id=current_user.id,
     )
 
     if not guest_id:
-        return build_cart_response(
-            get_cart_by_user_id(db, current_user.id)
+        user_cart = await get_cart_by_user_id(
+            db=db,
+            user_id=current_user.id,
         )
+        return build_cart_response(user_cart)
 
-    guest_cart = get_cart_by_guest_id(
+    guest_cart = await get_cart_by_guest_id(
         db=db,
         guest_id=guest_id,
     )
 
     if not guest_cart:
         response.delete_cookie(key=GUEST_CART_COOKIE)
-        return build_cart_response(
-            get_cart_by_user_id(db, current_user.id)
+
+        user_cart = await get_cart_by_user_id(
+            db=db,
+            user_id=current_user.id,
         )
 
-    user_cart = merge_guest_cart_into_user_cart(
+        return build_cart_response(user_cart)
+
+    user_cart = await merge_guest_cart_into_user_cart(
         db=db,
         guest_cart=guest_cart,
         user_cart=user_cart,

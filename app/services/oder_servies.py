@@ -1,21 +1,21 @@
+
 import logging
 from datetime import datetime, timedelta
-from app.models.product_variant import ProductVariant
 from decimal import Decimal
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.cart import Cart, CartItem
 from app.models.order import Order, OrderItem, OrderStatus
 from app.models.order_address import OrderAddress
+from app.models.orderitem_lot import OrderItemLot
+from app.models.invertory_lots import InventoryLot
 from app.models.payment import Payment, PaymentMethod, PaymentStatus
 from app.models.product import Product
+from app.models.product_variant import ProductVariant
 from app.models.user import User
-from sqlalchemy import or_
-
-from app.models.invertory_lots import InventoryLot
-from app.models.orderitem_lot import OrderItemLot
 
 from app.schemas.oder import CheckoutRequest
 
@@ -33,67 +33,81 @@ CARD_RESERVATION_MINUTES = 30
 # HELPER: GET PRODUCTS BELONGING TO AN ORDER
 # ============================================================
 
-def get_order_products(db: Session, order_id: int) -> list[Product]:
-    items = (
-        db.query(OrderItem)
-        .filter(OrderItem.order_id == order_id)
-        .all()
+async def get_order_products(
+    db: AsyncSession,
+    order_id: int,
+) -> list[Product]:
+
+    result = await db.execute(
+        select(OrderItem.product_id)
+        .where(OrderItem.order_id == order_id)
+        .distinct()
     )
 
-    product_ids = sorted({
-        item.product_id for item in items
-    })
+    product_ids = sorted(result.scalars().all())
 
     if not product_ids:
         return []
 
-    return (
-        db.query(Product)
-        .filter(Product.id.in_(product_ids))
+    result = await db.execute(
+        select(Product)
+        .where(Product.id.in_(product_ids))
         .order_by(Product.id)
-        .all()
     )
 
+    return result.scalars().all()
 
 
-def get_order_variants(db: Session, order_id: int) -> list[ProductVariant]:
-    """Return variants referenced by this order for inventory notifications."""
-    variant_ids = sorted({
-        row[0]
-        for row in (
-            db.query(OrderItem.variant_id)
-            .filter(
-                OrderItem.order_id == order_id,
-                OrderItem.variant_id.isnot(None),
-            )
-            .all()
+# ============================================================
+# HELPER: GET VARIANTS BELONGING TO AN ORDER
+# ============================================================
+
+async def get_order_variants(
+    db: AsyncSession,
+    order_id: int,
+) -> list[ProductVariant]:
+
+    result = await db.execute(
+        select(OrderItem.variant_id)
+        .where(
+            OrderItem.order_id == order_id,
+            OrderItem.variant_id.is_not(None),
         )
-        if row[0] is not None
-    })
+        .distinct()
+    )
+
+    variant_ids = sorted(
+        result.scalars().all()
+    )
 
     if not variant_ids:
         return []
 
-    return (
-        db.query(ProductVariant)
-        .filter(ProductVariant.id.in_(variant_ids))
+    result = await db.execute(
+        select(ProductVariant)
+        .where(ProductVariant.id.in_(variant_ids))
         .order_by(ProductVariant.id)
-        .all()
     )
 
+    return result.scalars().all()
 
-def consume_inventory_lots(
-    db: Session,
+
+# ============================================================
+# CONSUME INVENTORY LOTS
+# ============================================================
+
+async def consume_inventory_lots(
+    db: AsyncSession,
     order_item: OrderItem,
     product_id: int,
     variant_id: int | None,
     quantity: int,
 ) -> None:
     """
-    Deduct stock from inventory lots and record the allocation.
+    Deduct stock from inventory lots and record allocations.
 
     FEFO: earliest expiry first.
-    Lots without an expiry date are used after dated lots.
+    Lots without expiry dates are used after dated lots.
     Expired and depleted lots are excluded.
 
     The caller must commit or roll back the surrounding transaction.
@@ -101,7 +115,7 @@ def consume_inventory_lots(
 
     now = datetime.utcnow()
 
-    query = db.query(InventoryLot).filter(
+    query = select(InventoryLot).where(
         InventoryLot.quantity_remaining > 0,
         or_(
             InventoryLot.expires_at.is_(None),
@@ -110,17 +124,17 @@ def consume_inventory_lots(
     )
 
     if variant_id is not None:
-        query = query.filter(
+        query = query.where(
             InventoryLot.variant_id == variant_id,
             InventoryLot.product_id.is_(None),
         )
     else:
-        query = query.filter(
+        query = query.where(
             InventoryLot.product_id == product_id,
             InventoryLot.variant_id.is_(None),
         )
 
-    lots = (
+    query = (
         query
         .order_by(
             InventoryLot.expires_at.asc().nullslast(),
@@ -128,10 +142,14 @@ def consume_inventory_lots(
             InventoryLot.id.asc(),
         )
         .with_for_update()
-        .all()
     )
 
-    available = sum(lot.quantity_remaining for lot in lots)
+    result = await db.execute(query)
+    lots = result.scalars().all()
+
+    available = sum(
+        lot.quantity_remaining for lot in lots
+    )
 
     if available < quantity:
         raise HTTPException(
@@ -148,7 +166,10 @@ def consume_inventory_lots(
         if remaining == 0:
             break
 
-        deducted = min(lot.quantity_remaining, remaining)
+        deducted = min(
+            lot.quantity_remaining,
+            remaining,
+        )
 
         lot.quantity_remaining -= deducted
 
@@ -159,10 +180,10 @@ def consume_inventory_lots(
         )
 
         db.add(allocation)
+
         remaining -= deducted
 
-    db.flush()
-
+    await db.flush()
 
 
 # ============================================================
@@ -170,18 +191,22 @@ def consume_inventory_lots(
 # ============================================================
 
 async def checkout_cart(
-    db: Session,
+    db: AsyncSession,
     current_user: User,
     checkout_data: CheckoutRequest,
 ):
     try:
-        # Lock the cart to prevent concurrent checkouts.
-        cart = (
-            db.query(Cart)
-            .filter(Cart.user_id == current_user.id)
+        # ----------------------------------------------------
+        # 1. LOCK CUSTOMER CART
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(Cart)
+            .where(Cart.user_id == current_user.id)
             .with_for_update()
-            .first()
         )
+
+        cart = result.scalar_one_or_none()
 
         if not cart:
             raise HTTPException(
@@ -189,12 +214,21 @@ async def checkout_cart(
                 detail="Cart not found",
             )
 
-        cart_items = (
-            db.query(CartItem)
-            .filter(CartItem.cart_id == cart.id)
-            .order_by(CartItem.product_id)
-            .all()
+        # ----------------------------------------------------
+        # 2. GET CART ITEMS
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(CartItem)
+            .where(CartItem.cart_id == cart.id)
+            .order_by(
+                CartItem.product_id,
+                CartItem.variant_id,
+                CartItem.id,
+            )
         )
+
+        cart_items = result.scalars().all()
 
         if not cart_items:
             raise HTTPException(
@@ -211,42 +245,62 @@ async def checkout_cart(
                 detail="Invalid payment method",
             )
 
-        # Lock products in a consistent order.
+        # ----------------------------------------------------
+        # 3. LOCK PRODUCTS
+        # ----------------------------------------------------
+
         product_ids = sorted({
             item.product_id for item in cart_items
         })
 
-        products = (
-            db.query(Product)
-            .filter(Product.id.in_(product_ids))
+        result = await db.execute(
+            select(Product)
+            .where(Product.id.in_(product_ids))
             .order_by(Product.id)
             .with_for_update()
-            .all()
         )
+
+        products = result.scalars().all()
 
         product_map = {
             product.id: product
             for product in products
         }
 
-        # Lock all variants for these products in a consistent order.
-        # This also lets us reject a cart item that has no selected variant
-        # when the product is sold in sizes/colors.
-        variants = (
-            db.query(ProductVariant)
-            .filter(ProductVariant.product_id.in_(product_ids))
+        # ----------------------------------------------------
+        # 4. LOCK VARIANTS
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(ProductVariant)
+            .where(
+                ProductVariant.product_id.in_(product_ids)
+            )
             .order_by(ProductVariant.id)
             .with_for_update()
-            .all()
         )
-        variant_map = {variant.id: variant for variant in variants}
+
+        variants = result.scalars().all()
+
+        variant_map = {
+            variant.id: variant
+            for variant in variants
+        }
+
         variants_by_product = {}
+
         for variant in variants:
-            variants_by_product.setdefault(variant.product_id, []).append(variant)
+            variants_by_product.setdefault(
+                variant.product_id,
+                [],
+            ).append(variant)
+
+        # ----------------------------------------------------
+        # 5. VALIDATE PRODUCTS AND CALCULATE TOTAL
+        # ----------------------------------------------------
 
         total_amount = Decimal("0.00")
 
-        # Validate products/variants and calculate the final order total.
         for item in cart_items:
             product = product_map.get(item.product_id)
 
@@ -269,25 +323,46 @@ async def checkout_cart(
                 )
 
             variant = None
+
             if item.variant_id is not None:
                 variant = variant_map.get(item.variant_id)
-                if variant is None or variant.product_id != product.id:
+
+                if (
+                    variant is None
+                    or variant.product_id != product.id
+                ):
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Selected variant for '{product.name}' is invalid",
+                        detail=(
+                            f"Selected variant for "
+                            f"'{product.name}' is invalid"
+                        ),
                     )
+
                 if not variant.is_active:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Selected size/color for '{product.name}' is unavailable",
+                        detail=(
+                            f"Selected size/color for "
+                            f"'{product.name}' is unavailable"
+                        ),
                     )
+
             elif variants_by_product.get(product.id):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Select a size and color for '{product.name}'",
+                    detail=(
+                        f"Select a size and color for "
+                        f"'{product.name}'"
+                    ),
                 )
 
-            available_stock = variant.stock if variant is not None else product.stock
+            available_stock = (
+                variant.stock
+                if variant is not None
+                else product.stock
+            )
+
             if available_stock < item.quantity:
                 raise HTTPException(
                     status_code=400,
@@ -299,9 +374,13 @@ async def checkout_cart(
                 if variant is not None and variant.price is not None
                 else Decimal(str(product.price))
             )
+
             total_amount += unit_price * item.quantity
 
-        # Keep your existing minimum amount rule for card payments.
+        # ----------------------------------------------------
+        # 6. CARD PAYMENT MINIMUM AMOUNT
+        # ----------------------------------------------------
+
         if (
             checkout_data.payment_method == PaymentMethod.CARD
             and total_amount < Decimal("140.00")
@@ -311,6 +390,10 @@ async def checkout_cart(
                 detail="Card payment requires a higher order amount.",
             )
 
+        # ----------------------------------------------------
+        # 7. ORDER RESERVATION
+        # ----------------------------------------------------
+
         now = datetime.utcnow()
 
         reservation_expiry = (
@@ -319,7 +402,6 @@ async def checkout_cart(
             else None
         )
 
-        # Create the order.
         order = Order(
             user_id=current_user.id,
             total_amount=total_amount,
@@ -330,9 +412,13 @@ async def checkout_cart(
         )
 
         db.add(order)
-        db.flush()
 
-        # Save the shipping address.
+        await db.flush()
+
+        # ----------------------------------------------------
+        # 8. SAVE SHIPPING ADDRESS
+        # ----------------------------------------------------
+
         address = checkout_data.order_address
 
         db.add(
@@ -350,8 +436,10 @@ async def checkout_cart(
             )
         )
 
-        
-        # Create order items, consume lots, and update aggregate stock.
+        # ----------------------------------------------------
+        # 9. CREATE ORDER ITEMS AND CONSUME INVENTORY
+        # ----------------------------------------------------
+
         changed_variants = []
 
         for item in cart_items:
@@ -372,35 +460,48 @@ async def checkout_cart(
             order_item = OrderItem(
                 order_id=order.id,
                 product_id=product.id,
-                variant_id=variant.id if variant is not None else None,
-                variant_sku=variant.sku if variant is not None else None,
-                variant_size=variant.size if variant is not None else None,
-                variant_color=variant.color if variant is not None else None,
+                variant_id=(
+                    variant.id if variant is not None else None
+                ),
+                variant_sku=(
+                    variant.sku if variant is not None else None
+                ),
+                variant_size=(
+                    variant.size if variant is not None else None
+                ),
+                variant_color=(
+                    variant.color if variant is not None else None
+                ),
                 quantity=item.quantity,
                 unit_price=unit_price,
             )
 
             db.add(order_item)
-            db.flush()
 
-            # Consume the exact lots that supply this order item.
-            consume_inventory_lots(
+            await db.flush()
+
+            # Deduct from exact inventory lots using FEFO.
+            await consume_inventory_lots(
                 db=db,
                 order_item=order_item,
                 product_id=product.id,
-                variant_id=variant.id if variant is not None else None,
+                variant_id=(
+                    variant.id if variant is not None else None
+                ),
                 quantity=item.quantity,
             )
 
-            # Maintain the existing aggregate stock fields.
+            # Maintain aggregate stock fields.
             if variant is not None:
                 variant.stock -= item.quantity
                 changed_variants.append(variant)
             else:
                 product.stock -= item.quantity
 
+        # ----------------------------------------------------
+        # 10. CREATE PAYMENT
+        # ----------------------------------------------------
 
-        # Create the payment record.
         payment = Payment(
             order_id=order.id,
             amount=total_amount,
@@ -409,33 +510,48 @@ async def checkout_cart(
         )
 
         db.add(payment)
-        db.flush()
 
-        # Clear the cart in the same transaction.
+        await db.flush()
+
+        # ----------------------------------------------------
+        # 11. CLEAR CART
+        # ----------------------------------------------------
+
         for item in cart_items:
-            db.delete(item)
+            await db.delete(item)
 
         payment_url = None
 
-        # Create a Stripe Checkout Session for card payments.
+        # ----------------------------------------------------
+        # 12. CREATE STRIPE SESSION
+        # ----------------------------------------------------
+
         if checkout_data.payment_method == PaymentMethod.CARD:
-            db.flush()
+            await db.flush()
 
-            session = await create_payment_session(order, payment)
+            stripe_session = await create_payment_session(
+                order,
+                payment,
+            )
 
-            payment.session_id = session.id
-            payment_url = session.url
+            payment.session_id = stripe_session.id
+            payment_url = stripe_session.url
 
-        # Commit database changes before broadcasting events.
-        db.commit()
-        db.refresh(order)
+        # ----------------------------------------------------
+        # 13. COMMIT TRANSACTION
+        # ----------------------------------------------------
+
+        await db.commit()
+
+        await db.refresh(order)
 
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
 
     except Exception:
-        db.rollback()
+        await db.rollback()
+
         logger.exception("Checkout failed")
 
         raise HTTPException(
@@ -443,7 +559,10 @@ async def checkout_cart(
             detail="Failed to create order",
         )
 
-    # Broadcast inventory and order events for BOTH CARD and COD.
+    # ========================================================
+    # BROADCAST AFTER SUCCESSFUL COMMIT
+    # ========================================================
+
     try:
         await publish_inventory_updates(
             products,
@@ -457,7 +576,11 @@ async def checkout_cart(
             "order_id": order.id,
             "user_id": order.user_id,
             "total_amount": str(order.total_amount),
-            "status": getattr(order.status, "value", str(order.status)),
+            "status": getattr(
+                order.status,
+                "value",
+                str(order.status),
+            ),
             "payment_method": getattr(
                 checkout_data.payment_method,
                 "value",
@@ -466,8 +589,6 @@ async def checkout_cart(
         })
 
     except Exception:
-        # The order is already committed; do not report checkout failure
-        # just because a WebSocket notification failed.
         logger.exception(
             "Failed to broadcast checkout events for order %s",
             order.id,
@@ -484,9 +605,8 @@ async def checkout_cart(
 # RELEASE ORDER INVENTORY
 # ============================================================
 
-
-def release_order_inventory(
-    db: Session,
+async def release_order_inventory(
+    db: AsyncSession,
     order: Order,
 ) -> bool:
     """
@@ -502,82 +622,136 @@ def release_order_inventory(
     if order.inventory_deducted_at is None:
         return False
 
-    items = (
-        db.query(OrderItem)
-        .filter(OrderItem.order_id == order.id)
+    # --------------------------------------------------------
+    # 1. LOAD ORDER ITEMS
+    # --------------------------------------------------------
+
+    result = await db.execute(
+        select(OrderItem)
+        .where(OrderItem.order_id == order.id)
         .order_by(OrderItem.product_id, OrderItem.id)
-        .all()
     )
 
-    product_ids = sorted({item.product_id for item in items})
+    items = result.scalars().all()
+
+    product_ids = sorted({
+        item.product_id for item in items
+    })
+
     variant_ids = sorted({
         item.variant_id
         for item in items
         if item.variant_id is not None
     })
 
-    products = (
-        db.query(Product)
-        .filter(Product.id.in_(product_ids))
-        .order_by(Product.id)
-        .with_for_update()
-        .all()
-        if product_ids else []
-    )
-    product_map = {product.id: product for product in products}
+    # --------------------------------------------------------
+    # 2. LOCK PRODUCTS
+    # --------------------------------------------------------
 
-    variants = (
-        db.query(ProductVariant)
-        .filter(ProductVariant.id.in_(variant_ids))
-        .order_by(ProductVariant.id)
-        .with_for_update()
-        .all()
-        if variant_ids else []
-    )
-    variant_map = {variant.id: variant for variant in variants}
+    if product_ids:
+        result = await db.execute(
+            select(Product)
+            .where(Product.id.in_(product_ids))
+            .order_by(Product.id)
+            .with_for_update()
+        )
 
-    # Load all allocations for this order.
-    allocations = (
-        db.query(OrderItemLot)
-        .join(OrderItem, OrderItem.id == OrderItemLot.order_item_id)
-        .filter(OrderItem.order_id == order.id)
+        products = result.scalars().all()
+    else:
+        products = []
+
+    product_map = {
+        product.id: product
+        for product in products
+    }
+
+    # --------------------------------------------------------
+    # 3. LOCK VARIANTS
+    # --------------------------------------------------------
+
+    if variant_ids:
+        result = await db.execute(
+            select(ProductVariant)
+            .where(ProductVariant.id.in_(variant_ids))
+            .order_by(ProductVariant.id)
+            .with_for_update()
+        )
+
+        variants = result.scalars().all()
+    else:
+        variants = []
+
+    variant_map = {
+        variant.id: variant
+        for variant in variants
+    }
+
+    # --------------------------------------------------------
+    # 4. LOAD INVENTORY ALLOCATIONS
+    # --------------------------------------------------------
+
+    result = await db.execute(
+        select(OrderItemLot)
+        .join(
+            OrderItem,
+            OrderItem.id == OrderItemLot.order_item_id,
+        )
+        .where(OrderItem.order_id == order.id)
         .order_by(
             OrderItemLot.inventory_lot_id,
             OrderItemLot.id,
         )
-        .all()
     )
 
+    allocations = result.scalars().all()
+
     allocations_by_item = {}
+
     for allocation in allocations:
         allocations_by_item.setdefault(
-            allocation.order_item_id, []
+            allocation.order_item_id,
+            [],
         ).append(allocation)
 
-    # Lock the referenced lots before restoring quantities.
+    # --------------------------------------------------------
+    # 5. LOCK REFERENCED LOTS
+    # --------------------------------------------------------
+
     lot_ids = sorted({
         allocation.inventory_lot_id
         for allocation in allocations
     })
 
-    lots = (
-        db.query(InventoryLot)
-        .filter(InventoryLot.id.in_(lot_ids))
-        .order_by(InventoryLot.id)
-        .with_for_update()
-        .all()
-        if lot_ids else []
-    )
-    lot_map = {lot.id: lot for lot in lots}
+    if lot_ids:
+        result = await db.execute(
+            select(InventoryLot)
+            .where(InventoryLot.id.in_(lot_ids))
+            .order_by(InventoryLot.id)
+            .with_for_update()
+        )
+
+        lots = result.scalars().all()
+    else:
+        lots = []
+
+    lot_map = {
+        lot.id: lot
+        for lot in lots
+    }
+
+    # --------------------------------------------------------
+    # 6. VALIDATE ALLOCATIONS BEFORE RESTORING
+    # --------------------------------------------------------
 
     for item in items:
-        item_allocations = allocations_by_item.get(item.id, [])
+        item_allocations = allocations_by_item.get(
+            item.id,
+            [],
+        )
 
-        # A newly lot-tracked order must have allocations that add up
-        # to the order-item quantity. Do not silently restore incorrect
-        # inventory if allocation records are missing or incomplete.
         allocated_quantity = sum(
-            allocation.quantity for allocation in item_allocations
+            allocation.quantity
+            for allocation in item_allocations
         )
 
         if allocated_quantity != item.quantity:
@@ -588,17 +762,27 @@ def release_order_inventory(
             )
 
         for allocation in item_allocations:
-            lot = lot_map.get(allocation.inventory_lot_id)
-
-            if lot is None:
+            if allocation.inventory_lot_id not in lot_map:
                 raise RuntimeError(
                     f"Inventory lot {allocation.inventory_lot_id} "
                     f"is missing for order {order.id}"
                 )
 
+    # --------------------------------------------------------
+    # 7. RESTORE LOTS AND AGGREGATE STOCK
+    # --------------------------------------------------------
+
+    for item in items:
+        item_allocations = allocations_by_item.get(
+            item.id,
+            [],
+        )
+
+        for allocation in item_allocations:
+            lot = lot_map[allocation.inventory_lot_id]
+
             lot.quantity_remaining += allocation.quantity
 
-        # Restore the aggregate product or variant stock.
         if item.variant_id is not None:
             variant = variant_map.get(item.variant_id)
 
@@ -622,16 +806,18 @@ def release_order_inventory(
             product.stock += item.quantity
 
     order.inventory_released_at = datetime.utcnow()
-    db.flush()
+
+    await db.flush()
 
     return True
+
 
 # ============================================================
 # CANCEL ORDER
 # ============================================================
 
 async def cancel_order(
-    db: Session,
+    db: AsyncSession,
     current_user: User,
     order_id: int,
 ):
@@ -640,15 +826,20 @@ async def cancel_order(
     inventory_changed = False
 
     try:
-        order = (
-            db.query(Order)
-            .filter(
+        # ----------------------------------------------------
+        # 1. LOCK CUSTOMER ORDER
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(Order)
+            .where(
                 Order.id == order_id,
                 Order.user_id == current_user.id,
             )
             .with_for_update()
-            .first()
         )
+
+        order = result.scalar_one_or_none()
 
         if not order:
             raise HTTPException(
@@ -662,12 +853,17 @@ async def cancel_order(
                 detail="Only pending orders can be cancelled",
             )
 
-        payment = (
-            db.query(Payment)
-            .filter(Payment.order_id == order.id)
+        # ----------------------------------------------------
+        # 2. LOCK PAYMENT
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(Payment)
+            .where(Payment.order_id == order.id)
             .with_for_update()
-            .first()
         )
+
+        payment = result.scalar_one_or_none()
 
         if payment and payment.status == PaymentStatus.PAID:
             raise HTTPException(
@@ -678,38 +874,62 @@ async def cancel_order(
                 ),
             )
 
-        # Restore stock exactly once.
-        inventory_changed = release_order_inventory(db, order)
+        # ----------------------------------------------------
+        # 3. RESTORE INVENTORY
+        # ----------------------------------------------------
+
+        inventory_changed = await release_order_inventory(
+            db,
+            order,
+        )
 
         if inventory_changed:
-            inventory_products = get_order_products(db, order.id)
-            inventory_variants = get_order_variants(db, order.id)
+            inventory_products = await get_order_products(
+                db,
+                order.id,
+            )
+
+            inventory_variants = await get_order_variants(
+                db,
+                order.id,
+            )
 
         order.status = OrderStatus.CANCELLED
 
-        db.commit()
-        db.refresh(order)
+        await db.commit()
+        await db.refresh(order)
 
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
 
     except Exception:
-        db.rollback()
-        logger.exception("Failed to cancel order %s", order_id)
+        await db.rollback()
+
+        logger.exception(
+            "Failed to cancel order %s",
+            order_id,
+        )
 
         raise HTTPException(
             status_code=500,
             detail="Failed to cancel order",
         )
 
-    # Send WebSocket notifications after the successful commit.
+    # --------------------------------------------------------
+    # 4. WEBSOCKET NOTIFICATIONS AFTER COMMIT
+    # --------------------------------------------------------
+
     try:
         await manager.send_to_admin({
             "type": "order_cancelled",
             "order_id": order.id,
             "user_id": order.user_id,
-            "status": getattr(order.status, "value", str(order.status)),
+            "status": getattr(
+                order.status,
+                "value",
+                str(order.status),
+            ),
         })
 
         if inventory_changed:
@@ -755,12 +975,9 @@ ALLOWED_TRANSITIONS = {
 # ============================================================
 # UPDATE ORDER STATUS
 # ============================================================
-# ============================================================
-# UPDATE ORDER STATUS + REAL-TIME PAYMENT NOTIFICATIONS
-# ============================================================
 
 async def update_order_status(
-    db: Session,
+    db: AsyncSession,
     order_id: int,
     new_status: OrderStatus,
 ):
@@ -769,13 +986,17 @@ async def update_order_status(
     inventory_changed = False
 
     try:
-        # Lock the order to prevent simultaneous status updates.
-        order = (
-            db.query(Order)
-            .filter(Order.id == order_id)
+        # ----------------------------------------------------
+        # 1. LOCK ORDER
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(Order)
+            .where(Order.id == order_id)
             .with_for_update()
-            .first()
         )
+
+        order = result.scalar_one_or_none()
 
         if not order:
             raise HTTPException(
@@ -783,7 +1004,10 @@ async def update_order_status(
                 detail="Order not found",
             )
 
-        allowed = ALLOWED_TRANSITIONS.get(order.status, set())
+        allowed = ALLOWED_TRANSITIONS.get(
+            order.status,
+            set(),
+        )
 
         if new_status not in allowed:
             raise HTTPException(
@@ -795,16 +1019,24 @@ async def update_order_status(
                 ),
             )
 
-        # Find and lock the payment associated with this order.
-        payment = (
-            db.query(Payment)
-            .filter(Payment.order_id == order.id)
+        # ----------------------------------------------------
+        # 2. LOCK PAYMENT
+        # ----------------------------------------------------
+
+        result = await db.execute(
+            select(Payment)
+            .where(Payment.order_id == order.id)
             .with_for_update()
-            .first()
         )
 
-        # Card orders cannot be confirmed before payment succeeds.
+        payment = result.scalar_one_or_none()
+
+        # ----------------------------------------------------
+        # 3. VALIDATE CARD CONFIRMATION
+        # ----------------------------------------------------
+
         if new_status == OrderStatus.CONFIRMED:
+
             if (
                 payment
                 and payment.method == PaymentMethod.CARD
@@ -824,24 +1056,40 @@ async def update_order_status(
                     ),
                 )
 
-        # Restore stock if the admin cancels an unpaid order.
+        # ----------------------------------------------------
+        # 4. RESTORE STOCK IF ADMIN CANCELS UNPAID ORDER
+        # ----------------------------------------------------
+
         if new_status == OrderStatus.CANCELLED:
+
             if payment and payment.status == PaymentStatus.PAID:
                 raise HTTPException(
                     status_code=400,
                     detail="Paid orders require the refund workflow",
                 )
 
-            inventory_changed = release_order_inventory(db, order)
+            inventory_changed = await release_order_inventory(
+                db,
+                order,
+            )
 
             if inventory_changed:
-                inventory_products = get_order_products(db, order.id)
-                inventory_variants = get_order_variants(db, order.id)
+                inventory_products = await get_order_products(
+                    db,
+                    order.id,
+                )
+
+                inventory_variants = await get_order_variants(
+                    db,
+                    order.id,
+                )
 
         # ----------------------------------------------------
-        # COD PAYMENT UPDATE ON DELIVERY
+        # 5. COD PAYMENT UPDATE ON DELIVERY
         # ----------------------------------------------------
+
         if new_status == OrderStatus.DELIVERED:
+
             if not payment:
                 raise HTTPException(
                     status_code=400,
@@ -849,6 +1097,7 @@ async def update_order_status(
                 )
 
             if payment.method == PaymentMethod.COD:
+
                 if payment.status == PaymentStatus.PENDING:
                     # Assumes cash was collected at delivery.
                     payment.status = PaymentStatus.PAID
@@ -864,29 +1113,32 @@ async def update_order_status(
                     )
 
             elif payment.method == PaymentMethod.CARD:
+
                 if payment.status != PaymentStatus.PAID:
                     raise HTTPException(
                         status_code=400,
                         detail="Card payment must be paid before delivery",
                     )
 
-        # Update order status.
+        # ----------------------------------------------------
+        # 6. SAVE ORDER AND PAYMENT
+        # ----------------------------------------------------
+
         order.status = new_status
 
-        # Save order and payment changes together.
-        db.commit()
+        await db.commit()
 
-        db.refresh(order)
+        await db.refresh(order)
 
         if payment:
-            db.refresh(payment)
+            await db.refresh(payment)
 
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
 
     except Exception:
-        db.rollback()
+        await db.rollback()
 
         logger.exception(
             "Failed to update status for order %s",
@@ -898,9 +1150,10 @@ async def update_order_status(
             detail="Failed to update order status",
         )
 
-    # --------------------------------------------------------
-    # PREPARE DATA AFTER THE DATABASE COMMIT
-    # --------------------------------------------------------
+    # ========================================================
+    # PREPARE DATA AFTER COMMIT
+    # ========================================================
+
     order_status = getattr(
         order.status,
         "value",
@@ -933,8 +1186,9 @@ async def update_order_status(
     }
 
     # --------------------------------------------------------
-    # NOTIFY CUSTOMER OF ORDER STATUS
+    # 7. NOTIFY CUSTOMER OF ORDER STATUS
     # --------------------------------------------------------
+
     try:
         await manager.send_to_user(
             order.user_id,
@@ -946,6 +1200,7 @@ async def update_order_status(
                 },
             },
         )
+
     except Exception:
         logger.exception(
             "Failed to notify customer of order status for order %s",
@@ -953,14 +1208,16 @@ async def update_order_status(
         )
 
     # --------------------------------------------------------
-    # NOTIFY ADMIN OF ORDER STATUS
+    # 8. NOTIFY ADMIN OF ORDER STATUS
     # --------------------------------------------------------
+
     try:
         await manager.send_to_admin({
             "type": "order_status_updated",
             "user_id": order.user_id,
             **payment_data,
         })
+
     except Exception:
         logger.exception(
             "Failed to notify admin of order status for order %s",
@@ -968,15 +1225,16 @@ async def update_order_status(
         )
 
     # --------------------------------------------------------
-    # REAL-TIME COD PAYMENT EVENT
+    # 9. COD PAYMENT EVENT
     # --------------------------------------------------------
+
     if (
         new_status == OrderStatus.DELIVERED
         and payment is not None
         and payment.method == PaymentMethod.COD
         and payment.status == PaymentStatus.PAID
     ):
-        # Notify the customer.
+
         try:
             await manager.send_to_user(
                 order.user_id,
@@ -985,28 +1243,32 @@ async def update_order_status(
                     "data": payment_data,
                 },
             )
+
         except Exception:
             logger.exception(
-                "Failed to send COD payment update to customer for order %s",
+                "Failed to send COD payment update to customer "
+                "for order %s",
                 order.id,
             )
 
-        # Notify the admin.
         try:
             await manager.send_to_admin({
                 "type": "payment_status_updated",
                 "user_id": order.user_id,
                 **payment_data,
             })
+
         except Exception:
             logger.exception(
-                "Failed to send COD payment update to admin for order %s",
+                "Failed to send COD payment update to admin "
+                "for order %s",
                 order.id,
             )
 
     # --------------------------------------------------------
-    # BROADCAST INVENTORY UPDATE IF CANCELLATION RESTORED STOCK
+    # 10. BROADCAST RESTORED INVENTORY
     # --------------------------------------------------------
+
     if inventory_changed:
         try:
             await publish_inventory_updates(
@@ -1015,6 +1277,7 @@ async def update_order_status(
                 reason="order_cancelled",
                 order_id=order.id,
             )
+
         except Exception:
             logger.exception(
                 "Failed to broadcast restored inventory for order %s",

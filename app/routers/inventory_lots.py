@@ -1,8 +1,10 @@
+
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.permissions import admin_required
@@ -20,19 +22,27 @@ router = APIRouter(
 )
 
 
+def utc_now_naive():
+    """Return current UTC time without timezone information."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+# ============================================================
+# RECEIVE INVENTORY
+# ============================================================
+
 @router.post(
     "/",
     response_model=InventoryLotResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def receive_inventory(
+async def receive_inventory(
     payload: InventoryLotCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin=Depends(admin_required),
 ):
     try:
-        # Normalize timezone-aware expiry to naive UTC because
-        # the model uses DateTime(timezone=False).
+        # Normalize expiry date to naive UTC.
         expires_at = payload.expires_at
 
         if expires_at is not None:
@@ -41,21 +51,24 @@ def receive_inventory(
                     timezone.utc
                 ).replace(tzinfo=None)
 
-            if expires_at <= datetime.utcnow():
+            if expires_at <= utc_now_naive():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Cannot receive stock with an expired expiry date",
                 )
 
-        # Lock the target row so concurrent stock receipts do not
-        # overwrite each other's stock updates.
+        # ----------------------------------------------------
+        # RECEIVE STOCK FOR A VARIANT
+        # ----------------------------------------------------
+
         if payload.variant_id is not None:
-            variant = (
-                db.query(ProductVariant)
-                .filter(ProductVariant.id == payload.variant_id)
+            result = await db.execute(
+                select(ProductVariant)
+                .where(ProductVariant.id == payload.variant_id)
                 .with_for_update()
-                .first()
             )
+
+            variant = result.scalar_one_or_none()
 
             if variant is None:
                 raise HTTPException(
@@ -65,15 +78,21 @@ def receive_inventory(
 
             lot_product_id = None
             lot_variant_id = variant.id
+
             variant.stock += payload.quantity
 
+        # ----------------------------------------------------
+        # RECEIVE STOCK FOR A STANDALONE PRODUCT
+        # ----------------------------------------------------
+
         else:
-            product = (
-                db.query(Product)
-                .filter(Product.id == payload.product_id)
+            result = await db.execute(
+                select(Product)
+                .where(Product.id == payload.product_id)
                 .with_for_update()
-                .first()
             )
+
+            product = result.scalar_one_or_none()
 
             if product is None:
                 raise HTTPException(
@@ -81,12 +100,17 @@ def receive_inventory(
                     detail="Product not found",
                 )
 
-            # Do not add standalone product stock when the product
-            # uses variants. Its stock is tracked by each variant.
+            # Check whether this product has variants.
+            variant_result = await db.execute(
+                select(ProductVariant.id)
+                .where(
+                    ProductVariant.product_id == product.id
+                )
+                .limit(1)
+            )
+
             has_variants = (
-                db.query(ProductVariant.id)
-                .filter(ProductVariant.product_id == product.id)
-                .first()
+                variant_result.scalar_one_or_none() is not None
             )
 
             if has_variants:
@@ -100,7 +124,12 @@ def receive_inventory(
 
             lot_product_id = product.id
             lot_variant_id = None
+
             product.stock += payload.quantity
+
+        # ----------------------------------------------------
+        # CREATE INVENTORY LOT
+        # ----------------------------------------------------
 
         lot = InventoryLot(
             lot_number=payload.lot_number,
@@ -109,35 +138,44 @@ def receive_inventory(
             quantity_received=payload.quantity,
             quantity_remaining=payload.quantity,
             expires_at=expires_at,
-            received_at=datetime.utcnow(),
+            received_at=utc_now_naive(),
         )
 
         db.add(lot)
-        db.flush()
-        db.commit()
-        db.refresh(lot)
+
+        await db.flush()
+        await db.commit()
+        await db.refresh(lot)
 
         return lot
 
     except HTTPException:
-        db.rollback()
+        await db.rollback()
         raise
 
     except SQLAlchemyError:
-        db.rollback()
+        await db.rollback()
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not receive inventory",
         )
 
 
-@router.get("/", response_model=list[InventoryLotResponse])
-def list_inventory_lots(
+# ============================================================
+# LIST INVENTORY LOTS
+# ============================================================
+
+@router.get(
+    "/",
+    response_model=list[InventoryLotResponse],
+)
+async def list_inventory_lots(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=20, ge=1, le=100),
     product_id: int | None = Query(default=None, gt=0),
     variant_id: int | None = Query(default=None, gt=0),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin=Depends(admin_required),
 ):
     if product_id is not None and variant_id is not None:
@@ -146,33 +184,53 @@ def list_inventory_lots(
             detail="Provide product_id or variant_id, not both",
         )
 
-    query = db.query(InventoryLot)
+    query = select(InventoryLot)
 
     if product_id is not None:
-        query = query.filter(InventoryLot.product_id == product_id)
+        query = query.where(
+            InventoryLot.product_id == product_id
+        )
 
     if variant_id is not None:
-        query = query.filter(InventoryLot.variant_id == variant_id)
+        query = query.where(
+            InventoryLot.variant_id == variant_id
+        )
 
-    return (
-        query.order_by(InventoryLot.received_at.desc(), InventoryLot.id.desc())
+    query = (
+        query
+        .order_by(
+            InventoryLot.received_at.desc(),
+            InventoryLot.id.desc(),
+        )
         .offset(skip)
         .limit(limit)
-        .all()
     )
 
+    result = await db.execute(query)
 
-@router.get("/{lot_id}", response_model=InventoryLotResponse)
-def get_inventory_lot(
+    return result.scalars().all()
+
+
+# ============================================================
+# GET INVENTORY LOT BY ID
+# ============================================================
+
+@router.get(
+    "/{lot_id}",
+    response_model=InventoryLotResponse,
+)
+async def get_inventory_lot(
     lot_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     admin=Depends(admin_required),
 ):
-    lot = (
-        db.query(InventoryLot)
-        .filter(InventoryLot.id == lot_id)
-        .first()
+    result = await db.execute(
+        select(InventoryLot).where(
+            InventoryLot.id == lot_id
+        )
     )
+
+    lot = result.scalar_one_or_none()
 
     if lot is None:
         raise HTTPException(

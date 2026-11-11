@@ -1,16 +1,17 @@
+
 from fastapi import Depends, HTTPException, status
 
 from app.dependencies.auth import get_current_user
-from app.models.user import User
+from app.models.user import User, UserRole
 
 
-def admin_required(
+async def admin_required(
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "admin":
+    if current_user.role != UserRole.ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only admin can perform this action",
+            detail="Admin access required",
         )
 
     return current_user

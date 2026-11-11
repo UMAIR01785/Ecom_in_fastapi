@@ -1,6 +1,7 @@
 
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.permissions import admin_required
@@ -15,14 +16,14 @@ router = APIRouter(
 
 
 @router.get("/", response_model=list[UserResponse])
-def get_all_users(
-    db: Session = Depends(get_db),
+async def get_all_users(
+    db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(admin_required),
 ):
-    users = (
-        db.query(User)
-        .order_by(User.id.desc())
-        .all()
+    result = await db.execute(
+        select(User).order_by(User.id.desc())
     )
+
+    users = result.scalars().all()
 
     return users
