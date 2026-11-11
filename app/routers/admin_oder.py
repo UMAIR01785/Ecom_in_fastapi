@@ -1,3 +1,4 @@
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -5,13 +6,11 @@ from fastapi import (
     status,
 )
 
-from sqlalchemy.orm import (
-    Session,
-    joinedload,
-)
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.schemas.admin_order import OrderStatusUpdate
-
 from app.database import get_db
 
 from app.models.order import (
@@ -20,7 +19,6 @@ from app.models.order import (
 )
 
 from app.models.user import User
-
 from app.dependencies.permissions import admin_required
 
 from app.services.oder_servies import (
@@ -38,33 +36,32 @@ router = APIRouter(
 # GET ALL ORDERS
 # ============================================================
 
-
 @router.get("/")
-def get_all_orders(
-    db: Session = Depends(get_db),
+async def get_all_orders(
+    db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(admin_required),
 ):
-    orders = (
-        db.query(Order)
+    result = await db.execute(
+        select(Order)
         .options(
             # Customer
             joinedload(Order.user),
 
             # Order items + product
-            joinedload(Order.items)
-            .joinedload(OrderItem.product),
+            selectinload(Order.items).joinedload(
+                OrderItem.product
+            ),
 
-            # Order shipping address
+            # Shipping address
             joinedload(Order.shipping_address),
 
             # Payment
             joinedload(Order.payment),
         )
-        .order_by(
-            Order.created_at.desc()
-        )
-        .all()
+        .order_by(Order.created_at.desc())
     )
+
+    orders = result.scalars().all()
 
     return orders
 
@@ -73,14 +70,11 @@ def get_all_orders(
 # UPDATE ORDER STATUS
 # ============================================================
 
-
-@router.patch(
-    "/{order_id}/status"
-)
+@router.patch("/{order_id}/status")
 async def update_order_status_admin(
     order_id: int,
     data: OrderStatusUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(admin_required),
 ):
     return await update_order_status(
@@ -94,38 +88,35 @@ async def update_order_status_admin(
 # GET SINGLE ORDER DETAIL
 # ============================================================
 
-
-@router.get(
-    "/{order_id}"
-)
-def get_order_detail(
+@router.get("/{order_id}")
+async def get_order_detail(
     order_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_admin: User = Depends(admin_required),
 ):
-    order = (
-        db.query(Order)
+    result = await db.execute(
+        select(Order)
         .options(
             # Customer
             joinedload(Order.user),
 
             # Order items + product
-            joinedload(Order.items)
-            .joinedload(OrderItem.product),
+            selectinload(Order.items).joinedload(
+                OrderItem.product
+            ),
 
-            # Order shipping address
+            # Shipping address
             joinedload(Order.shipping_address),
 
             # Payment
             joinedload(Order.payment),
         )
-        .filter(
-            Order.id == order_id
-        )
-        .first()
+        .where(Order.id == order_id)
     )
 
-    if not order:
+    order = result.scalar_one_or_none()
+
+    if order is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Order not found",

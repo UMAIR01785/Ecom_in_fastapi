@@ -1,7 +1,9 @@
+
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.customer_agent import run_customer_agent
 from app.models.user import User
@@ -21,8 +23,8 @@ class ShoppingChatAIError(Exception):
     """Raised when the shopping assistant cannot respond."""
 
 
-def send_shopping_message(
-    db: Session,
+async def send_shopping_message(
+    db: AsyncSession,
     *,
     content: str,
     user_id: int | None,
@@ -32,6 +34,7 @@ def send_shopping_message(
     current_user: User | None = None,
     confirmation_authorized: bool = False,
 ) -> dict:
+
     content = content.strip()
 
     if not content:
@@ -55,22 +58,23 @@ def send_shopping_message(
     conversation = None
 
     if conversation_id is not None:
-        query = db.query(ShoppingChatConversation).filter(
+        statement = select(ShoppingChatConversation).where(
             ShoppingChatConversation.id == conversation_id
         )
 
         if user_id is not None:
-            query = query.filter(
+            statement = statement.where(
                 ShoppingChatConversation.user_id == user_id
             )
         else:
-            query = query.filter(
+            statement = statement.where(
                 ShoppingChatConversation.user_id.is_(None),
                 ShoppingChatConversation.guest_session_id
                 == guest_session_id,
             )
 
-        conversation = query.first()
+        result = await db.execute(statement)
+        conversation = result.scalar_one_or_none()
 
         if conversation is None:
             raise LookupError("Conversation not found")
@@ -89,47 +93,61 @@ def send_shopping_message(
                 created_at=now,
                 updated_at=now,
             )
+
             db.add(conversation)
-            db.flush()
+
+            # Generate conversation.id before creating the message.
+            await db.flush()
 
         user_message = ShoppingChatMessage(
             conversation_id=conversation.id,
             role="user",
             content=content,
         )
+
         db.add(user_message)
         conversation.updated_at = now
-        db.commit()
-        db.refresh(user_message)
+
+        await db.commit()
+        await db.refresh(user_message)
 
     except Exception:
-        db.rollback()
+        await db.rollback()
         logger.exception("Failed to save shopping chat message")
         raise
 
     # Load the latest 12 messages in chronological order.
-    history = (
-        db.query(ShoppingChatMessage)
-        .filter(
+    history_statement = (
+        select(ShoppingChatMessage)
+        .where(
             ShoppingChatMessage.conversation_id == conversation.id
         )
         .order_by(ShoppingChatMessage.id.desc())
         .limit(12)
-        .all()
     )
-    history.reverse()
+
+    try:
+        history_result = await db.execute(history_statement)
+        history = list(history_result.scalars().all())
+        history.reverse()
+
+    except Exception:
+        logger.exception("Failed to load shopping chat history")
+        raise
 
     # Resolve the correct cart for the current customer.
     try:
         if user_id is not None:
-            cart = get_or_create_user_cart(db, user_id)
+            cart = await get_or_create_user_cart(db, user_id)
+
         elif guest_cart_id:
-            cart = get_or_create_guest_cart(db, guest_cart_id)
+            cart = await get_or_create_guest_cart(db, guest_cart_id)
+
         else:
             cart = None
 
         # Generate the AI reply and structured product cards.
-        reply, products = run_customer_agent(
+        reply, products = await run_customer_agent(
             db=db,
             history=history,
             cart=cart,
@@ -141,7 +159,10 @@ def send_shopping_message(
             raise ValueError("The AI returned an empty reply")
 
     except Exception as exc:
+        await db.rollback()
+
         logger.exception("Shopping chat agent failed")
+
         raise ShoppingChatAIError(
             "The shopping assistant is temporarily unavailable."
         ) from exc
@@ -156,11 +177,12 @@ def send_shopping_message(
     try:
         db.add(assistant_message)
         conversation.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(assistant_message)
+
+        await db.commit()
+        await db.refresh(assistant_message)
 
     except Exception:
-        db.rollback()
+        await db.rollback()
         logger.exception("Failed to save shopping assistant reply")
         raise
 

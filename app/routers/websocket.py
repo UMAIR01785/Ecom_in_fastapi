@@ -1,6 +1,6 @@
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.models.user import UserRole
@@ -12,6 +12,10 @@ from app.websockets.auth import (
 
 router = APIRouter()
 
+
+# ============================================================
+# CUSTOMER ORDER WEBSOCKET
+# ============================================================
 
 @router.websocket("/ws/orders")
 async def order_websocket(websocket: WebSocket):
@@ -26,16 +30,24 @@ async def order_websocket(websocket: WebSocket):
     try:
         while True:
             await websocket.receive_text()
+
     except WebSocketDisconnect:
         manager.disconnect(user_id, websocket)
 
 
+# ============================================================
+# ADMIN ORDER WEBSOCKET
+# ============================================================
+
 @router.websocket("/ws/admin/orders")
 async def admin_order_websocket(
     websocket: WebSocket,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    user = await get_websocket_user(websocket, db)
+    user = await get_websocket_user(
+        websocket,
+        db,
+    )
 
     if user is None or not user.is_active:
         await websocket.close(code=1008)
@@ -50,8 +62,14 @@ async def admin_order_websocket(
     try:
         while True:
             await websocket.receive_text()
+
     except WebSocketDisconnect:
         manager.disconnect_admin(websocket)
+
+
+# ============================================================
+# CATALOG WEBSOCKET
+# ============================================================
 
 @router.websocket("/ws/catalog")
 async def catalog_websocket(websocket: WebSocket):

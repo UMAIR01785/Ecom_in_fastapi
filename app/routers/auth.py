@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 
 import jwt
@@ -9,7 +10,8 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.core.security import (
@@ -23,10 +25,11 @@ from app.core.security import (
 )
 from app.database import get_db
 from app.models.refresh_token import RefreshToken
-from app.models.user import User,UserRole
+from app.models.user import User, UserRole
 from app.models.profile import Profile
 from pwdlib import PasswordHash
-from app.schemas.user import UserResponse,UserCreate,UserLogin
+from app.schemas.user import UserResponse, UserCreate, UserLogin
+
 
 router = APIRouter(prefix="/accounts", tags=["Authentication"])
 
@@ -37,25 +40,31 @@ def set_refresh_cookie(
     response: Response,
     token: str,
 ) -> None:
-        response.set_cookie(
-            key="refresh_token",
-            value=token,
-            httponly=True,
-            secure=settings.refresh_cookie_secure,
-            samesite="lax",
-            max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
-            path="/accounts",
-        )
+    response.set_cookie(
+        key="refresh_token",
+        value=token,
+        httponly=True,
+        secure=True, # MUST be True for SameSite=None
+        samesite="none", # Required for cross-site cookie transmission (Vercel frontend to Cloudflare backend)
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
+        path="/accounts",
+    )
 
 
+# -----------------------------------------
+# REGISTER
+# -----------------------------------------
 
 @router.post("/register", response_model=UserResponse)
-def register(
+async def register(
     user_data: UserCreate,
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     # 1. Check if email already exists
-    existing_email = db.query(User).filter(User.email == user_data.email).first()
+    result = await db.execute(
+        select(User).where(User.email == user_data.email)
+    )
+    existing_email = result.scalar_one_or_none()
 
     if existing_email:
         raise HTTPException(
@@ -64,9 +73,10 @@ def register(
         )
 
     # 2. Check if username already exists
-    existing_username = db.query(User).filter(
-        User.username == user_data.username
-    ).first()
+    result = await db.execute(
+        select(User).where(User.username == user_data.username)
+    )
+    existing_username = result.scalar_one_or_none()
 
     if existing_username:
         raise HTTPException(
@@ -80,11 +90,12 @@ def register(
             status_code=400,
             detail="Passwords do not match"
         )
-    if not len(user_data.password ) > 8:
+
+    if not len(user_data.password) > 8:
         raise HTTPException(
-                    status_code=400,
-                    detail="Passwords length is greater then 8"
-                )
+            status_code=400,
+            detail="Passwords length is greater then 8"
+        )
 
     # 4. Hash password
     hashed_password = password_hash.hash(user_data.password)
@@ -102,28 +113,35 @@ def register(
 
     # 6. Save to database
     db.add(new_user)
-    db.flush()
+    await db.flush()
+
     new_profile = Profile(
-    user_id=new_user.id
-)
+        user_id=new_user.id
+    )
+
     db.add(new_profile)
-    
-    db.commit()
-    db.refresh(new_user)
+
+    await db.commit()
+    await db.refresh(new_user)
 
     # 7. Return user
     return new_user
 
 
+# -----------------------------------------
+# LOGIN
+# -----------------------------------------
+
 @router.post("/login")
-def login(
+async def login(
     user_data: UserLogin,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    user = db.query(User).filter(
-        User.email == user_data.email
-    ).first()
+    result = await db.execute(
+        select(User).where(User.email == user_data.email)
+    )
+    user = result.scalar_one_or_none()
 
     if not user or not password_hash.verify(
         user_data.password,
@@ -155,7 +173,7 @@ def login(
     )
 
     db.add(refresh_record)
-    db.commit()
+    await db.commit()
 
     set_refresh_cookie(response, refresh_token)
 
@@ -164,11 +182,16 @@ def login(
         "token_type": "bearer",
     }
 
+
+# -----------------------------------------
+# REFRESH ACCESS TOKEN
+# -----------------------------------------
+
 @router.post("/refresh")
-def refresh_access_token(
+async def refresh_access_token(
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     refresh_token = request.cookies.get("refresh_token")
 
@@ -208,15 +231,16 @@ def refresh_access_token(
     token_hash = hash_refresh_token(refresh_token)
 
     # Lock this session row while validating and rotating it.
-    stored_token = (
-        db.query(RefreshToken)
-        .filter(
+    result = await db.execute(
+        select(RefreshToken)
+        .where(
             RefreshToken.user_id == user_id,
             RefreshToken.token_hash == token_hash,
         )
         .with_for_update()
-        .first()
     )
+
+    stored_token = result.scalar_one_or_none()
 
     if (
         stored_token is None
@@ -228,7 +252,10 @@ def refresh_access_token(
             detail="Refresh session is invalid or expired",
         )
 
-    user = db.get(User, user_id)
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+    )
+    user = result.scalar_one_or_none()
 
     if user is None or not user.is_active:
         raise HTTPException(
@@ -257,7 +284,7 @@ def refresh_access_token(
     )
 
     # Revoke and create the new session record atomically.
-    db.commit()
+    await db.commit()
 
     set_refresh_cookie(response, new_refresh_token)
 
@@ -265,28 +292,33 @@ def refresh_access_token(
         "access_token": new_access_token,
         "token_type": "bearer",
     }
-    
+
+
+# -----------------------------------------
+# LOGOUT
+# -----------------------------------------
+
 @router.post("/logout")
-def logout(
+async def logout(
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
     refresh_token = request.cookies.get("refresh_token")
 
     if refresh_token:
-        stored_token = (
-            db.query(RefreshToken)
-            .filter(
+        result = await db.execute(
+            select(RefreshToken).where(
                 RefreshToken.token_hash
                 == hash_refresh_token(refresh_token)
             )
-            .first()
         )
+
+        stored_token = result.scalar_one_or_none()
 
         if stored_token and stored_token.revoked_at is None:
             stored_token.revoked_at = datetime.now(timezone.utc)
-            db.commit()
+            await db.commit()
 
     response.delete_cookie(
         key="refresh_token",

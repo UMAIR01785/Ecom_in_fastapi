@@ -1,7 +1,8 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies.permissions import admin_required
@@ -16,39 +17,44 @@ from app.schemas.product_variant import (
 router = APIRouter(tags=["Product Variants"])
 
 
-def get_product_or_404(db: Session, product_id: int) -> Product:
-    product = (
-        db.query(Product)
-        .filter(Product.id == product_id)
-        .first()
+async def get_product_or_404(
+    db: AsyncSession,
+    product_id: int,
+) -> Product:
+
+    result = await db.execute(
+        select(Product).where(Product.id == product_id)
     )
+
+    product = result.scalar_one_or_none()
 
     if product is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found",
         )
 
     return product
 
 
-def get_variant_or_404(
-    db: Session,
+async def get_variant_or_404(
+    db: AsyncSession,
     product_id: int,
     variant_id: int,
 ) -> ProductVariant:
-    variant = (
-        db.query(ProductVariant)
-        .filter(
+
+    result = await db.execute(
+        select(ProductVariant).where(
             ProductVariant.id == variant_id,
             ProductVariant.product_id == product_id,
         )
-        .first()
     )
+
+    variant = result.scalar_one_or_none()
 
     if variant is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Variant not found for this product",
         )
 
@@ -60,17 +66,18 @@ def get_variant_or_404(
     response_model=ProductVariantResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_variant(
+async def create_variant(
     product_id: int,
     payload: ProductVariantCreate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    product = get_product_or_404(db, product_id)
+
+    product = await get_product_or_404(db, product_id)
 
     if not product.is_active:
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot add a variant to an inactive product",
         )
 
@@ -87,15 +94,15 @@ def create_variant(
     db.add(variant)
 
     try:
-        db.commit()
-        db.refresh(variant)
+        await db.commit()
+        await db.refresh(variant)
+
     except IntegrityError:
-        db.rollback()
+        await db.rollback()
+
         raise HTTPException(
-            status_code=409,
-            detail=(
-                "SKU or size/color combination already exists"
-            ),
+            status_code=status.HTTP_409_CONFLICT,
+            detail="SKU or size/color combination already exists",
         )
 
     return variant
@@ -105,63 +112,77 @@ def create_variant(
     "/{product_id}/variants",
     response_model=list[ProductVariantResponse],
 )
-def list_variants(
+async def list_variants(
     product_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ):
-    get_product_or_404(db, product_id)
 
-    return (
-        db.query(ProductVariant)
-        .filter(ProductVariant.product_id == product_id)
-        .order_by(ProductVariant.size, ProductVariant.color)
-        .all()
+    await get_product_or_404(db, product_id)
+
+    result = await db.execute(
+        select(ProductVariant)
+        .where(ProductVariant.product_id == product_id)
+        .order_by(
+            ProductVariant.size,
+            ProductVariant.color,
+        )
     )
+
+    return result.scalars().all()
 
 
 @router.patch(
     "/{product_id}/variants/{variant_id}",
     response_model=ProductVariantResponse,
 )
-def update_variant(
+async def update_variant(
     product_id: int,
     variant_id: int,
     payload: ProductVariantUpdate,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    get_product_or_404(db, product_id)
-    variant = get_variant_or_404(db, product_id, variant_id)
+
+    await get_product_or_404(db, product_id)
+
+    variant = await get_variant_or_404(
+        db,
+        product_id,
+        variant_id,
+    )
 
     changes = payload.model_dump(exclude_unset=True)
 
     for field, value in changes.items():
+
         if field in {"sku", "size", "color"}:
+
             if value is None:
                 raise HTTPException(
-                    status_code=422,
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"{field} cannot be null",
                 )
+
             value = value.strip()
 
         if field in {"stock", "is_active"} and value is None:
             raise HTTPException(
-                status_code=422,
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"{field} cannot be null",
             )
 
         setattr(variant, field, value)
 
     try:
-        db.commit()
-        db.refresh(variant)
+        await db.commit()
+        await db.refresh(variant)
+
     except IntegrityError:
-        db.rollback()
+        await db.rollback()
+
         raise HTTPException(
-            status_code=409,
-            detail=(
-                "SKU or size/color combination already exists"
-            ),
+            status_code=status.HTTP_409_CONFLICT,
+            detail="SKU or size/color combination already exists",
         )
 
     return variant
@@ -170,18 +191,28 @@ def update_variant(
 @router.delete(
     "/{product_id}/variants/{variant_id}",
 )
-def deactivate_variant(
+async def deactivate_variant(
     product_id: int,
     variant_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user=Depends(admin_required),
 ):
-    get_product_or_404(db, product_id)
-    variant = get_variant_or_404(db, product_id, variant_id)
 
-    # Deactivate instead of physically deleting inventory history.
+    await get_product_or_404(db, product_id)
+
+    variant = await get_variant_or_404(
+        db,
+        product_id,
+        variant_id,
+    )
+
+    # Preserve inventory history.
+    # Deactivate instead of physically deleting.
     variant.is_active = False
-    db.commit()
-    db.refresh(variant)
 
-    return {"message": "Variant deactivated successfully"}
+    await db.commit()
+    await db.refresh(variant)
+
+    return {
+        "message": "Variant deactivated successfully"
+    }

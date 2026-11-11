@@ -1,5 +1,8 @@
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload, selectinload
 
 from app.database import get_db
 from app.dependencies.auth import get_current_user
@@ -29,7 +32,6 @@ router = APIRouter(
 # CHECKOUT
 # ============================================================
 
-
 @router.post(
     "/checkout",
     response_model=CheckoutResponse,
@@ -37,7 +39,7 @@ router = APIRouter(
 )
 async def checkout(
     checkout_data: CheckoutRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     return await checkout_cart(
@@ -51,36 +53,35 @@ async def checkout(
 # GET MY ORDERS
 # ============================================================
 
-
 @router.get(
     "/",
     response_model=list[OrderResponse],
 )
-def get_my_orders(
-    db: Session = Depends(get_db),
+async def get_my_orders(
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    orders = (
-        db.query(Order)
+    query = (
+        select(Order)
         .options(
-            # Order items + product
-            joinedload(Order.items)
-            .joinedload(OrderItem.product),
+            # Order items and their products
+            selectinload(Order.items).joinedload(
+                OrderItem.product
+            ),
 
             # Payment
-            joinedload(Order.payment),
+            selectinload(Order.payment),
 
             # Shipping address
-            joinedload(Order.shipping_address),
+            selectinload(Order.shipping_address),
         )
-        .filter(
-            Order.user_id == current_user.id
-        )
-        .order_by(
-            Order.created_at.desc()
-        )
-        .all()
+        .where(Order.user_id == current_user.id)
+        .order_by(Order.created_at.desc())
     )
+
+    result = await db.execute(query)
+
+    orders = result.scalars().all()
 
     return orders
 
@@ -89,37 +90,40 @@ def get_my_orders(
 # GET SINGLE ORDER
 # ============================================================
 
-
 @router.get(
     "/{order_id}",
     response_model=OrderResponse,
 )
-def get_order(
+async def get_order(
     order_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    order = (
-        db.query(Order)
+    query = (
+        select(Order)
         .options(
-            # Order items + product
-            joinedload(Order.items)
-            .joinedload(OrderItem.product),
+            # Order items and their products
+            selectinload(Order.items).joinedload(
+                OrderItem.product
+            ),
 
             # Payment
-            joinedload(Order.payment),
+            selectinload(Order.payment),
 
             # Shipping address
-            joinedload(Order.shipping_address),
+            selectinload(Order.shipping_address),
         )
-        .filter(
+        .where(
             Order.id == order_id,
             Order.user_id == current_user.id,
         )
-        .first()
     )
 
-    if not order:
+    result = await db.execute(query)
+
+    order = result.scalar_one_or_none()
+
+    if order is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Order not found",
@@ -132,14 +136,13 @@ def get_order(
 # CANCEL MY ORDER
 # ============================================================
 
-
 @router.patch(
     "/{order_id}/cancel",
     response_model=OrderResponse,
 )
 async def cancel_my_order(
     order_id: int,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     return await cancel_order(

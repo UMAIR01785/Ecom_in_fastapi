@@ -10,7 +10,7 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.services.oder_servies import checkout_cart
 from app.database import get_db
@@ -38,15 +38,19 @@ GUEST_CHAT_COOKIE = "shopping_chat_session"
 GUEST_CART_COOKIE = "guest_cart_id"
 
 
+# ============================================================
+# SEND SHOPPING CHAT MESSAGE
+# ============================================================
+
 @router.post(
     "/messages",
     response_model=ShoppingChatResponse,
 )
-def send_message(
+async def send_message(
     data: ShoppingChatMessageRequest,
     request: Request,
     response: Response,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
     guest_session_id = request.cookies.get(GUEST_CHAT_COOKIE)
@@ -79,7 +83,7 @@ def send_message(
         )
 
     try:
-        return send_shopping_message(
+        return await send_shopping_message(
             db=db,
             content=data.message,
             user_id=current_user.id if current_user else None,
@@ -87,7 +91,7 @@ def send_message(
             guest_cart_id=guest_cart_id,
             conversation_id=data.conversation_id,
 
-            # NEW: pass the trusted authenticated user.
+            # Pass the trusted authenticated user.
             current_user=current_user,
 
             # Keep false until backend confirmation-state
@@ -113,14 +117,25 @@ def send_message(
             detail=str(exc),
         ) from exc
 
+    except HTTPException:
+        raise
+
     except Exception as exc:
-        db.rollback()
-        logger.exception("Failed to process shopping chat request")
+        await db.rollback()
+
+        logger.exception(
+            "Failed to process shopping chat request"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process shopping message",
         ) from exc
 
+
+# ============================================================
+# CHECKOUT FROM SHOPPING CHAT
+# ============================================================
 
 @router.post(
     "/checkout",
@@ -128,7 +143,7 @@ def send_message(
 )
 async def checkout_from_chat(
     data: ShoppingChatCheckoutRequest,
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User | None = Depends(get_optional_current_user),
 ):
     # Checkout is available only to authenticated customers.
@@ -151,14 +166,19 @@ async def checkout_from_chat(
             current_user=current_user,
             checkout_data=data.checkout,
         )
+
         return result
 
     except HTTPException:
         raise
 
     except Exception as exc:
-        db.rollback()
-        logger.exception("Shopping chat checkout failed")
+        await db.rollback()
+
+        logger.exception(
+            "Shopping chat checkout failed"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Checkout failed. Please try again.",

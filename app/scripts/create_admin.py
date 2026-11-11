@@ -1,8 +1,8 @@
 
-import app.models
-
+import asyncio
 from getpass import getpass
-from sqlalchemy.orm import Session
+
+from sqlalchemy import select, or_
 
 from app.database import SessionLocal
 from app.models.user import User, UserRole
@@ -10,93 +10,97 @@ from app.models.profile import Profile
 from app.core.security import hash_password
 
 
-def create_admin():
-    db: Session = SessionLocal()
+async def create_admin():
+    print("=== Create Admin User ===")
 
-    try:
-        print("=== Create Admin User ===")
+    first_name = input("First name: ").strip()
+    last_name = input("Last name: ").strip()
+    username = input("Username: ").strip()
+    email = input("Email: ").strip().lower()
+    phone_number = input("Phone number: ").strip()
 
-        first_name = input("First name: ").strip()
-        last_name = input("Last name: ").strip()
-        username = input("Username: ").strip()
-        email = input("Email: ").strip().lower()
-        phone_number = input("Phone number: ").strip()
+    password = getpass("Password: ")
+    confirm_password = getpass("Confirm password: ")
 
-        password = getpass("Password: ")
-        confirm_password = getpass("Confirm password: ")
+    # Validate required fields
+    if not all([
+        first_name,
+        last_name,
+        username,
+        email,
+        phone_number,
+        password,
+    ]):
+        print("All fields are required.")
+        return
 
-        # Validate required fields
-        if not all([
-            first_name,
-            last_name,
-            username,
-            email,
-            phone_number,
-            password,
-        ]):
-            print("All fields are required.")
-            return
+    if password != confirm_password:
+        print("Passwords do not match.")
+        return
 
-        if password != confirm_password:
-            print("Passwords do not match.")
-            return
+    
 
-        # Check for existing email, username, or phone
-        existing_user = (
-            db.query(User)
-            .filter(
-                (User.email == email)
-                | (User.username == username)
-                | (User.phone_number == phone_number)
+    async with SessionLocal() as db:
+        try:
+            # Check existing email, username, or phone
+            result = await db.execute(
+                select(User).where(
+                    or_(
+                        User.email == email,
+                        User.username == username,
+                        User.phone_number == phone_number,
+                    )
+                )
             )
-            .first()
-        )
 
-        if existing_user:
-            print(
-                "Email, username, or phone number "
-                "already exists."
+            existing_user = result.scalar_one_or_none()
+
+            if existing_user:
+                print(
+                    "Email, username, or phone number "
+                    "already exists."
+                )
+                return
+
+            # Create admin
+            admin = User(
+                first_name=first_name,
+                last_name=last_name,
+                username=username,
+                email=email,
+                phone_number=phone_number,
+                password_hash=hash_password(password),
+                role=UserRole.ADMIN,
+                is_active=True,
             )
-            return
 
-        # Create admin
-        admin = User(
-            first_name=first_name,
-            last_name=last_name,
-            username=username,
-            email=email,
-            phone_number=phone_number,
-            password_hash=hash_password(password),
-            role=UserRole.ADMIN,
-            is_active=True,
-        )
+            db.add(admin)
 
-        db.add(admin)
-        db.flush()  # Generates admin.id without committing
+            # Generate admin ID
+            await db.flush()
 
-        # Create the associated profile
-        profile = Profile(user_id=admin.id)
-        db.add(profile)
+            # Create associated profile
+            profile = Profile(user_id=admin.id)
+            db.add(profile)
 
-        # Save both records in one transaction
-        db.commit()
-        db.refresh(admin)
-        db.refresh(profile)
+            # Commit both records together
+            await db.commit()
 
-        print("\nAdmin created successfully!")
-        print(f"ID: {admin.id}")
-        print(f"Username: {admin.username}")
-        print(f"Email: {admin.email}")
-        print(f"Role: {admin.role.value}")
-        print(f"Profile ID: {profile.id}")
+            # Reload generated database values
+            await db.refresh(admin)
+            await db.refresh(profile)
 
-    except Exception as e:
-        db.rollback()
-        print(f"Error creating admin: {e}")
+            print("\nAdmin created successfully!")
+            print(f"ID: {admin.id}")
+            print(f"Username: {admin.username}")
+            print(f"Email: {admin.email}")
+            print(f"Role: {admin.role.value}")
+            print(f"Profile ID: {profile.id}")
 
-    finally:
-        db.close()
+        except Exception as e:
+            await db.rollback()
+            print(f"Error creating admin: {e}")
 
 
 if __name__ == "__main__":
-    create_admin()
+    asyncio.run(create_admin())
