@@ -1,6 +1,6 @@
-import json
 from decimal import Decimal
 from math import ceil
+from app.services.inventory_service import receive_product_inventory
 
 from fastapi import (
     APIRouter,
@@ -8,7 +8,6 @@ from fastapi import (
     File,
     Form,
     HTTPException,
-    Response,
     UploadFile,
     Query,
     status,
@@ -18,7 +17,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.cloudinary import upload_product_image
-from app.core.redis import redis_client
 from app.database import get_db
 from app.dependencies.permissions import admin_required
 from app.models.category import Category
@@ -37,20 +35,6 @@ router = APIRouter(
 # ============================================================
 # HELPERS
 # ============================================================
-
-async def invalidate_active_products_cache() -> None:
-    """
-    Remove every cached active-product pagination response.
-
-    Cache keys currently follow:
-        products:active:page:{page}:limit:{limit}
-    """
-    async for key in redis_client.scan_iter(
-        match="products:active:*",
-        count=100,
-    ):
-        await redis_client.delete(key)
-
 
 async def get_categories_by_slugs(
     db: AsyncSession,
@@ -153,21 +137,35 @@ async def create_product(
         image_url = await upload_product_image(image)
 
     product = Product(
-        name=name,
-        slug=slug,
-        description=description,
-        price=price,
-        stock=stock,
-        image=image_url,
-        is_active=is_active,
-        categories=categories,
-    )
-
-    product_id = product.id
+    name=name,
+    slug=slug,
+    description=description,
+    price=price,
+    stock=0,  # Stock will be added through an inventory lot
+    image=image_url,
+    is_active=is_active,
+    categories=categories,
+)
 
     try:
         db.add(product)
+
+        # Save the product temporarily to generate its database ID.
+        await db.flush()
+
+        product_id = product.id
+
+        # Create the initial inventory lot only when stock is greater than zero.
+        if stock > 0:
+            await receive_product_inventory(
+                db=db,
+                product=product,
+                quantity=stock,
+            )
+
+        # Save product and inventory lot together.
         await db.commit()
+
     except Exception:
         await db.rollback()
         raise
@@ -175,7 +173,6 @@ async def create_product(
     # Re-query with categories loaded. This avoids async lazy-loading
     # when ProductResponse reads Product.category_slugs.
     saved_product = await get_product_with_categories(db, product_id)
-    await invalidate_active_products_cache()
 
     return saved_product
 
@@ -229,21 +226,10 @@ async def get_all_products_admin(
     response_model=PaginatedResponse[ProductResponse],
 )
 async def get_products(
-    response: Response,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
-    cache_key = f"products:active:page:{page}:limit:{limit}"
-
-    cached_products = await redis_client.get(cache_key)
-
-    if cached_products is not None:
-        response.headers["X-Cache"] = "HIT"
-        if isinstance(cached_products, bytes):
-            cached_products = cached_products.decode("utf-8")
-        return json.loads(cached_products)
-
     filters = Product.is_active.is_(True)
 
     total_result = await db.execute(
@@ -278,13 +264,6 @@ async def get_products(
         "total_pages": total_pages,
     }
 
-    await redis_client.set(
-        cache_key,
-        json.dumps(result),
-        ex=600,
-    )
-
-    response.headers["X-Cache"] = "MISS"
     return result
 
 
@@ -385,7 +364,7 @@ async def update_product(
     name: str | None = Form(None),
     description: str | None = Form(None),
     price: Decimal | None = Form(None),
-    stock: int | None = Form(None),
+    
     is_active: bool | None = Form(None),
     category_slugs: list[str] | None = Form(None),
     image: UploadFile | None = File(None),
@@ -425,11 +404,7 @@ async def update_product(
             detail="Price must be greater than zero",
         )
 
-    if stock is not None and stock < 0:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Stock cannot be negative",
-        )
+    
 
     if name is not None:
         new_slug = generate_slug(name)
@@ -459,8 +434,7 @@ async def update_product(
     # With inventory lots enabled, stock changes should instead be routed
     # through the inventory service so Product.stock and lot quantities
     # remain consistent.
-    if stock is not None:
-        product.stock = stock
+    
 
     if is_active is not None:
         product.is_active = is_active
@@ -481,7 +455,6 @@ async def update_product(
         raise
 
     updated_product = await get_product_with_categories(db, product_id)
-    await invalidate_active_products_cache()
 
     return updated_product
 
@@ -525,16 +498,14 @@ async def delete_product(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found in this category",
         )
-
-    product.is_active = False
+    product.is_active = False  # Soft delete by marking as inactive
+    product.quantity = 0  # Soft delete by setting quantity to 0
 
     try:
         await db.commit()
     except Exception:
         await db.rollback()
         raise
-
-    await invalidate_active_products_cache()
 
     return {
         "message": "Product deleted successfully"

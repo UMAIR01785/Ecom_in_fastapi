@@ -1,16 +1,14 @@
 
-import asyncio
 from decimal import Decimal
 import logging
 
 from fastapi import HTTPException
 from langchain_core.tools import tool
-from sqlalchemy.orm import Session
-from app.schemas.oder import CheckoutRequest
-from app.services.oder_servies import checkout_cart
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.cart import Cart
 from app.models.user import User
+
 from app.services.cart import (
     add_to_cart as cart_add_to_cart,
     calculate_subtotal,
@@ -19,6 +17,7 @@ from app.services.cart import (
     remove_from_cart as cart_remove_from_cart,
     update_cart_item as cart_update_item,
 )
+
 from app.services.product_search_service import (
     search_products,
     build_shopping_product_response,
@@ -31,12 +30,12 @@ MAX_QUANTITY = 20
 
 
 def create_customer_product_tools(
-    db: Session,
+    db: AsyncSession,
     cart: Cart | None = None,
     current_user: User | None = None,
     confirmation_authorized: bool = False,
 ):
-    """Create shopping tools for the current customer's trusted cart."""
+    """Create asynchronous shopping tools for the current customer's cart."""
 
     def serialize_cart(current_cart: Cart) -> dict:
         items = []
@@ -74,20 +73,20 @@ def create_customer_product_tools(
             "currency": "PKR",
         }
 
-    def refresh_cart() -> Cart | None:
+    async def refresh_cart() -> Cart | None:
         if cart is None:
             return None
 
         if cart.user_id is not None:
-            return get_cart_by_user_id(db, cart.user_id)
+            return await get_cart_by_user_id(db, cart.user_id)
 
         if cart.guest_id is not None:
-            return get_cart_by_guest_id(db, cart.guest_id)
+            return await get_cart_by_guest_id(db, cart.guest_id)
 
         return None
 
     @tool
-    def search_shoes(
+    async def search_shoes(
         keyword: str | None = None,
         color: str | None = None,
         category: str | None = None,
@@ -114,42 +113,53 @@ def create_customer_product_tools(
         ):
             return {"error": "Minimum price exceeds maximum price."}
 
-        products = search_products(
-            db,
-            keyword=keyword,
-            color=color,
-            category=category,
-            min_price=(
-                Decimal(str(min_price))
-                if min_price is not None
-                else None
-            ),
-            max_price=(
-                Decimal(str(max_price))
-                if max_price is not None
-                else None
-            ),
-            available_only=True,
-            limit=limit,
-        )
+        try:
+            products = await search_products(
+                db,
+                keyword=keyword,
+                color=color,
+                category=category,
+                min_price=(
+                    Decimal(str(min_price))
+                    if min_price is not None
+                    else None
+                ),
+                max_price=(
+                    Decimal(str(max_price))
+                    if max_price is not None
+                    else None
+                ),
+                available_only=True,
+                limit=limit,
+            )
 
-        return {
-            "count": len(products),
-            "products": [
-                build_shopping_product_response(product)
-                for product in products
-            ],
-        }
+            return {
+                "count": len(products),
+                "products": [
+                    build_shopping_product_response(product)
+                    for product in products
+                ],
+            }
+
+        except Exception:
+            logger.exception("Chatbot search_shoes failed")
+            return {
+                "success": False,
+                "message": "Could not search products.",
+            }
 
     @tool
-    def get_product_details(product_id: int) -> dict:
+    async def get_product_details(product_id: int) -> dict:
         """Retrieve current product details and available variants."""
 
         if product_id <= 0:
-            return {"success": False, "message": "Invalid product ID."}
+            return {
+                "success": False,
+                "message": "Invalid product ID.",
+            }
 
         try:
-            products = search_products(
+            products = await search_products(
                 db,
                 keyword=None,
                 color=None,
@@ -184,7 +194,7 @@ def create_customer_product_tools(
             }
 
     @tool
-    def add_to_cart(
+    async def add_to_cart(
         product_id: int,
         quantity: int = 1,
         variant_id: int | None = None,
@@ -192,10 +202,16 @@ def create_customer_product_tools(
         """Add a product and optional selected variant to the current cart."""
 
         if cart is None:
-            return {"success": False, "message": "Cart is unavailable."}
+            return {
+                "success": False,
+                "message": "Cart is unavailable.",
+            }
 
         if product_id <= 0:
-            return {"success": False, "message": "Invalid product ID."}
+            return {
+                "success": False,
+                "message": "Invalid product ID.",
+            }
 
         if not 1 <= quantity <= MAX_QUANTITY:
             return {
@@ -204,12 +220,23 @@ def create_customer_product_tools(
             }
 
         if variant_id is not None and variant_id <= 0:
-            return {"success": False, "message": "Invalid variant ID."}
+            return {
+                "success": False,
+                "message": "Invalid variant ID.",
+            }
 
         try:
-            updated_cart = cart_add_to_cart(
+            current_cart = await refresh_cart()
+
+            if current_cart is None:
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
+
+            updated_cart = await cart_add_to_cart(
                 db=db,
-                cart=cart,
+                cart=current_cart,
                 product_id=product_id,
                 quantity=quantity,
                 variant_id=variant_id,
@@ -221,10 +248,13 @@ def create_customer_product_tools(
             }
 
         except HTTPException as exc:
-            return {"success": False, "message": str(exc.detail)}
+            return {
+                "success": False,
+                "message": str(exc.detail),
+            }
 
         except Exception:
-            db.rollback()
+            await db.rollback()
             logger.exception("Chatbot add_to_cart failed")
             return {
                 "success": False,
@@ -232,14 +262,17 @@ def create_customer_product_tools(
             }
 
     @tool
-    def get_cart() -> dict:
+    async def get_cart() -> dict:
         """Retrieve the current cart, selected variants, and subtotal."""
 
         try:
-            current_cart = refresh_cart()
+            current_cart = await refresh_cart()
 
             if current_cart is None:
-                return {"success": False, "message": "Cart not found."}
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
 
             return serialize_cart(current_cart)
 
@@ -251,17 +284,23 @@ def create_customer_product_tools(
             }
 
     @tool
-    def update_cart_item(
+    async def update_cart_item(
         cart_item_id: int,
         quantity: int,
     ) -> dict:
         """Update the quantity of an item belonging to the current cart."""
 
         if cart is None:
-            return {"success": False, "message": "Cart is unavailable."}
+            return {
+                "success": False,
+                "message": "Cart is unavailable.",
+            }
 
         if cart_item_id <= 0:
-            return {"success": False, "message": "Invalid cart item ID."}
+            return {
+                "success": False,
+                "message": "Invalid cart item ID.",
+            }
 
         if not 1 <= quantity <= MAX_QUANTITY:
             return {
@@ -270,15 +309,26 @@ def create_customer_product_tools(
             }
 
         try:
-            updated_cart = cart_update_item(
+            current_cart = await refresh_cart()
+
+            if current_cart is None:
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
+
+            updated_cart = await cart_update_item(
                 db=db,
-                cart=cart,
+                cart=current_cart,
                 cart_item_id=cart_item_id,
                 quantity=quantity,
             )
 
             if updated_cart is None:
-                return {"success": False, "message": "Cart not found."}
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
 
             return {
                 **serialize_cart(updated_cart),
@@ -286,10 +336,13 @@ def create_customer_product_tools(
             }
 
         except HTTPException as exc:
-            return {"success": False, "message": str(exc.detail)}
+            return {
+                "success": False,
+                "message": str(exc.detail),
+            }
 
         except Exception:
-            db.rollback()
+            await db.rollback()
             logger.exception("Chatbot update_cart_item failed")
             return {
                 "success": False,
@@ -297,24 +350,41 @@ def create_customer_product_tools(
             }
 
     @tool
-    def remove_from_cart(cart_item_id: int) -> dict:
+    async def remove_from_cart(cart_item_id: int) -> dict:
         """Remove an item belonging to the current cart."""
 
         if cart is None:
-            return {"success": False, "message": "Cart is unavailable."}
+            return {
+                "success": False,
+                "message": "Cart is unavailable.",
+            }
 
         if cart_item_id <= 0:
-            return {"success": False, "message": "Invalid cart item ID."}
+            return {
+                "success": False,
+                "message": "Invalid cart item ID.",
+            }
 
         try:
-            updated_cart = cart_remove_from_cart(
+            current_cart = await refresh_cart()
+
+            if current_cart is None:
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
+
+            updated_cart = await cart_remove_from_cart(
                 db=db,
-                cart=cart,
+                cart=current_cart,
                 cart_item_id=cart_item_id,
             )
 
             if updated_cart is None:
-                return {"success": False, "message": "Cart not found."}
+                return {
+                    "success": False,
+                    "message": "Cart not found.",
+                }
 
             return {
                 **serialize_cart(updated_cart),
@@ -322,17 +392,19 @@ def create_customer_product_tools(
             }
 
         except HTTPException as exc:
-            return {"success": False, "message": str(exc.detail)}
+            return {
+                "success": False,
+                "message": str(exc.detail),
+            }
 
         except Exception:
-            db.rollback()
+            await db.rollback()
             logger.exception("Chatbot remove_from_cart failed")
             return {
                 "success": False,
                 "message": "Could not remove the cart item.",
             }
-   
-    
+
     return [
         search_shoes,
         get_product_details,

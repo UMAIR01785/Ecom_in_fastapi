@@ -1,6 +1,4 @@
 
-import json
-
 from fastapi import (
     APIRouter,
     Depends,
@@ -16,7 +14,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.slug import generate_slug
 from app.websockets.manager import manager
-from app.core.redis import redis_client
 from app.core.cloudinary import upload_category_image
 from app.database import get_db
 from app.dependencies.permissions import admin_required
@@ -125,9 +122,6 @@ async def create_category(
         await db.rollback()
         raise
 
-    # Clear cached active categories
-    await redis_client.delete("categories:active")
-
     await manager.broadcast_to_catalog({
         "type": "catalog_updated",
         "entity": "category",
@@ -228,9 +222,6 @@ async def update_category(
         await db.rollback()
         raise
 
-    # Clear cached active categories
-    await redis_client.delete("categories:active")
-
     await manager.broadcast_to_catalog({
         "type": "catalog_updated",
         "entity": "category",
@@ -275,9 +266,6 @@ async def delete_category(
         await db.rollback()
         raise
 
-    # Clear cached active categories
-    await redis_client.delete("categories:active")
-
     await manager.broadcast_to_catalog({
         "type": "catalog_updated",
         "entity": "category",
@@ -299,17 +287,8 @@ async def delete_category(
     response_model=list[CategoryResponse],
 )
 async def get_active_categories(
-    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    cache_key = "categories:active"
-
-    cached_categories = await redis_client.get(cache_key)
-
-    if cached_categories is not None:
-        response.headers["X-Cache"] = "HIT"
-        return json.loads(cached_categories)
-
     result = await db.execute(
         select(Category)
         .where(Category.is_active.is_(True))
@@ -318,20 +297,7 @@ async def get_active_categories(
 
     categories = result.scalars().all()
 
-    result_data = [
-        CategoryResponse.model_validate(category).model_dump(mode="json")
-        for category in categories
-    ]
-
-    await redis_client.set(
-        cache_key,
-        json.dumps(result_data),
-        ex=600,
-    )
-
-    response.headers["X-Cache"] = "MISS"
-
-    return result_data
+    return categories
 
 
 # ============================================================

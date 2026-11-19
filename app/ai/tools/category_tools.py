@@ -1,24 +1,30 @@
+
 import re
 
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.tools import tool
 
 from app.models.category import Category
 
 
-def create_category_tools(db: Session):
+def create_category_tools(db: AsyncSession):
+
     @tool
-    def list_categories(limit: int = 20) -> dict:
-        """List product categories."""
+    async def list_categories(limit: int = 20) -> dict:
+        """List available product categories."""
+
         if not 1 <= limit <= 50:
             return {"error": "Limit must be between 1 and 50"}
 
-        categories = (
-            db.query(Category)
+        result = await db.execute(
+            select(Category)
             .order_by(Category.id.asc())
             .limit(limit)
-            .all()
         )
+
+        categories = result.scalars().all()
 
         return {
             "categories": [
@@ -32,8 +38,9 @@ def create_category_tools(db: Session):
         }
 
     @tool
-    def create_category(name: str) -> dict:
+    async def create_category(name: str) -> dict:
         """Create a category after validating its name."""
+
         name = name.strip()
 
         if not name or len(name) > 100:
@@ -41,28 +48,47 @@ def create_category_tools(db: Session):
                 "error": "Category name must be between 1 and 100 characters"
             }
 
-        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        slug = re.sub(
+            r"[^a-z0-9]+",
+            "-",
+            name.lower()
+        ).strip("-")
 
         if not slug:
-            return {"error": "Could not generate a valid category slug"}
+            return {
+                "error": "Could not generate a valid category slug"
+            }
 
-        existing = (
-            db.query(Category)
-            .filter(Category.slug == slug)
-            .first()
+        result = await db.execute(
+            select(Category).where(Category.slug == slug)
         )
 
-        if existing:
-            return {"error": "A category with this slug already exists"}
+        existing = result.scalar_one_or_none()
 
-        category = Category(name=name, slug=slug)
+        if existing:
+            return {
+                "error": "A category with this slug already exists"
+            }
+
+        category = Category(
+            name=name,
+            slug=slug
+        )
 
         try:
             db.add(category)
-            db.commit()
-            db.refresh(category)
+
+            await db.commit()
+            await db.refresh(category)
+
+        except IntegrityError:
+            await db.rollback()
+            return {
+                "error": "Category already exists or violates a database constraint"
+            }
+
         except Exception:
-            db.rollback()
+            await db.rollback()
             raise
 
         return {
@@ -72,4 +98,4 @@ def create_category_tools(db: Session):
             "slug": category.slug,
         }
 
-    return [list_categories]
+    return [list_categories, create_category]

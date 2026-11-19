@@ -15,6 +15,8 @@ from app.schemas.inventory_lots import (
     InventoryLotCreate,
     InventoryLotResponse,
 )
+from app.services.inventory_service import receive_product_inventory
+
 
 router = APIRouter(
     prefix="/inventory-lots",
@@ -42,7 +44,6 @@ async def receive_inventory(
     admin=Depends(admin_required),
 ):
     try:
-        # Normalize expiry date to naive UTC.
         expires_at = payload.expires_at
 
         if expires_at is not None:
@@ -76,10 +77,19 @@ async def receive_inventory(
                     detail="Product variant not found",
                 )
 
-            lot_product_id = None
-            lot_variant_id = variant.id
-
             variant.stock += payload.quantity
+
+            lot = InventoryLot(
+                lot_number=payload.lot_number,
+                product_id=None,
+                variant_id=variant.id,
+                quantity_received=payload.quantity,
+                quantity_remaining=payload.quantity,
+                expires_at=expires_at,
+                received_at=utc_now_naive(),
+            )
+
+            db.add(lot)
 
         # ----------------------------------------------------
         # RECEIVE STOCK FOR A STANDALONE PRODUCT
@@ -100,12 +110,11 @@ async def receive_inventory(
                     detail="Product not found",
                 )
 
-            # Check whether this product has variants.
+            # Products with variants must receive stock
+            # against a specific variant.
             variant_result = await db.execute(
                 select(ProductVariant.id)
-                .where(
-                    ProductVariant.product_id == product.id
-                )
+                .where(ProductVariant.product_id == product.id)
                 .limit(1)
             )
 
@@ -122,26 +131,17 @@ async def receive_inventory(
                     ),
                 )
 
-            lot_product_id = product.id
-            lot_variant_id = None
-
-            product.stock += payload.quantity
+            lot = await receive_product_inventory(
+                db=db,
+                product=product,
+                quantity=payload.quantity,
+                lot_number=payload.lot_number,
+                expires_at=expires_at,
+            )
 
         # ----------------------------------------------------
-        # CREATE INVENTORY LOT
+        # COMMIT TRANSACTION
         # ----------------------------------------------------
-
-        lot = InventoryLot(
-            lot_number=payload.lot_number,
-            product_id=lot_product_id,
-            variant_id=lot_variant_id,
-            quantity_received=payload.quantity,
-            quantity_remaining=payload.quantity,
-            expires_at=expires_at,
-            received_at=utc_now_naive(),
-        )
-
-        db.add(lot)
 
         await db.flush()
         await db.commit()

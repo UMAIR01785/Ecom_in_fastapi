@@ -1,6 +1,8 @@
 
 import os
+from dotenv import load_dotenv
 
+load_dotenv(override=True)
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import (
@@ -8,16 +10,16 @@ from sqlalchemy.ext.asyncio import (
     AsyncSession,
 )
 from sqlalchemy.pool import NullPool
-from app.config import settings
+
 from app.database import Base, get_db
 from app.main import app
 
-# Require a dedicated PostgreSQL test database.
-TEST_DATABASE_URL = settings.database_url
+
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
 if not TEST_DATABASE_URL:
     raise RuntimeError(
-        "TEST_DATABASE_URL is missing. Configure a separate PostgreSQL test database."
+        "TEST_DATABASE_URL is missing. Configure a dedicated test database."
     )
 
 if not TEST_DATABASE_URL.startswith("postgresql+psycopg://"):
@@ -25,16 +27,22 @@ if not TEST_DATABASE_URL.startswith("postgresql+psycopg://"):
         "TEST_DATABASE_URL must use postgresql+psycopg://"
     )
 
-engine = create_async_engine(
-    TEST_DATABASE_URL,
-    pool_pre_ping=True,
-    poolclass=NullPool,
-)
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def engine():
+    test_engine = create_async_engine(
+        TEST_DATABASE_URL,
+        pool_pre_ping=True,
+        poolclass=NullPool,
+    )
+
+    yield test_engine
+
+    await test_engine.dispose()
 
 
-@pytest_asyncio.fixture
-async def setup_db():
-    """Create and remove test tables for each test."""
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
+async def setup_db(engine):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -44,9 +52,8 @@ async def setup_db():
         await conn.run_sync(Base.metadata.drop_all)
 
 
-@pytest_asyncio.fixture
-async def db_session(setup_db):
-    """Provide an isolated transactional database session."""
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
+async def db_session(engine, setup_db):
     async with engine.connect() as connection:
         transaction = await connection.begin()
 
@@ -57,12 +64,12 @@ async def db_session(setup_db):
         ) as session:
             yield session
 
-        await transaction.rollback()
+        if transaction.is_active:
+            await transaction.rollback()
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
 async def override_get_db(db_session):
-    """Override FastAPI database dependency."""
     async def _get_db_override():
         yield db_session
 
@@ -73,17 +80,10 @@ async def override_get_db(db_session):
     app.dependency_overrides.pop(get_db, None)
 
 
-@pytest_asyncio.fixture
+@pytest_asyncio.fixture(scope="function", loop_scope="session")
 async def client(override_get_db):
-    """Provide an async HTTP client."""
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
     ) as async_client:
         yield async_client
-
-
-@pytest_asyncio.fixture
-async def dispose_test_engine():
-    yield
-    await engine.dispose()

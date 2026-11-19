@@ -2,7 +2,12 @@
 from app.models.product import Product
 from app.models.product_variant import ProductVariant
 from app.websockets.manager import manager
+from datetime import datetime
+from uuid import uuid4
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.invertory_lots import InventoryLot
 
 async def publish_inventory_updates(
     products: list[Product],
@@ -71,3 +76,48 @@ async def publish_inventory_updates(
         "ids": product_ids,
         "reason": reason,
     })
+
+
+async def receive_product_inventory(
+    db: AsyncSession,
+    product: Product,
+    quantity: int,
+    *,
+    lot_number: str | None = None,
+    expires_at: datetime | None = None,
+) -> InventoryLot:
+    """
+    Receive stock for a standalone product.
+
+    Creates an inventory lot and updates Product.stock.
+    The caller is responsible for committing or rolling back.
+    """
+
+    if quantity <= 0:
+        raise ValueError("Inventory quantity must be greater than zero")
+
+    # Generate a unique lot reference if admin did not provide one.
+    if lot_number is None:
+        lot_number = (
+            f"PRD-{product.id}-{uuid4().hex[:10].upper()}"
+        )
+
+    # Create inventory lot.
+    lot = InventoryLot(
+        lot_number=lot_number,
+        product_id=product.id,
+        variant_id=None,
+        quantity_received=quantity,
+        quantity_remaining=quantity,
+        expires_at=expires_at,
+        received_at=datetime.utcnow(),
+    )
+
+    db.add(lot)
+
+    # Update aggregate product stock.
+    product.stock += quantity
+
+    await db.flush()
+
+    return lot

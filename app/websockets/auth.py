@@ -1,6 +1,8 @@
+
 from jose import JWTError, jwt
 from fastapi import WebSocket
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import SECRET_KEY, ALGORITHM
 from app.models.user import User
@@ -37,20 +39,19 @@ async def get_websocket_user_id(
 
 async def get_websocket_user(
     websocket: WebSocket,
-    db: Session,
+    db: AsyncSession,
 ) -> User | None:
+
     user_id = await get_websocket_user_id(websocket)
 
     if user_id is None:
         return None
 
-    user = (
-        db.query(User)
-        .filter(
+    result = await db.execute(
+        select(User).where(
             User.id == user_id,
             User.is_active.is_(True),
         )
-        .first()
     )
 
-    return user
+    return result.scalar_one_or_none()

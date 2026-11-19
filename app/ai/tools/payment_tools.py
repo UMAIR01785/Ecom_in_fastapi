@@ -1,23 +1,28 @@
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.tools import tool
 
 from app.models.payment import Payment, PaymentStatus
 
 
-def create_payment_tools(db: Session):
+def create_payment_tools(db: AsyncSession):
+
     @tool
-    def get_payment_summary() -> dict:
+    async def get_payment_summary() -> dict:
         """Count payments and sum amounts grouped by payment status."""
-        rows = (
-            db.query(
+
+        query = (
+            select(
                 Payment.status,
                 func.count(Payment.id),
                 func.coalesce(func.sum(Payment.amount), 0),
             )
             .group_by(Payment.status)
-            .all()
         )
+
+        result = await db.execute(query)
+        rows = result.all()
 
         return {
             "payments": [
@@ -31,13 +36,17 @@ def create_payment_tools(db: Session):
         }
 
     @tool
-    def get_payment_details(payment_id: int) -> dict:
+    async def get_payment_details(payment_id: int) -> dict:
         """Retrieve payment details by payment ID."""
-        payment = (
-            db.query(Payment)
-            .filter(Payment.id == payment_id)
-            .first()
+
+        if payment_id <= 0:
+            return {"error": "Invalid payment ID"}
+
+        result = await db.execute(
+            select(Payment).where(Payment.id == payment_id)
         )
+
+        payment = result.scalar_one_or_none()
 
         if not payment:
             return {"error": "Payment not found"}
@@ -53,16 +62,19 @@ def create_payment_tools(db: Session):
         }
 
     @tool
-    def get_paid_sales_summary() -> dict:
+    async def get_paid_sales_summary() -> dict:
         """Sum payment records marked as paid."""
-        count, total = (
-            db.query(
+
+        query = (
+            select(
                 func.count(Payment.id),
                 func.coalesce(func.sum(Payment.amount), 0),
             )
-            .filter(Payment.status == PaymentStatus.PAID)
-            .one()
+            .where(Payment.status == PaymentStatus.PAID)
         )
+
+        result = await db.execute(query)
+        count, total = result.one()
 
         return {
             "paid_payment_count": count,

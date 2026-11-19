@@ -6,6 +6,7 @@ from decimal import Decimal
 from fastapi import HTTPException
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models.cart import Cart, CartItem
 from app.models.order import Order, OrderItem, OrderStatus
@@ -543,7 +544,16 @@ async def checkout_cart(
 
         await db.commit()
 
-        await db.refresh(order)
+        result = await db.execute(
+            select(Order)
+            .options(
+                selectinload(Order.shipping_address),
+                selectinload(Order.items).joinedload(OrderItem.product),
+                selectinload(Order.payment),
+            )
+            .where(Order.id == order.id)
+        )
+        order = result.scalar_one()
 
     except HTTPException:
         await db.rollback()
