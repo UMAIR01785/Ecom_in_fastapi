@@ -232,6 +232,7 @@ async def get_products(
 ):
     filters = Product.is_active.is_(True)
 
+    # Count total active products
     total_result = await db.execute(
         select(func.count())
         .select_from(Product)
@@ -239,14 +240,16 @@ async def get_products(
     )
     total = total_result.scalar_one()
 
+    # Fetch newest products first
     products_result = await db.execute(
         select(Product)
         .options(selectinload(Product.categories))
         .where(filters)
-        .order_by(Product.id)
+        .order_by(Product.created_at.desc())
         .offset((page - 1) * limit)
         .limit(limit)
     )
+
     products = products_result.scalars().all()
 
     items = [
@@ -256,7 +259,7 @@ async def get_products(
 
     total_pages = ceil(total / limit) if total else 0
 
-    result = {
+    result= {
         "items": items,
         "total": total,
         "page": page,

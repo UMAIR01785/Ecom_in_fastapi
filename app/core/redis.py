@@ -1,4 +1,3 @@
-
 import logging
 
 import redis.asyncio as redis
@@ -15,6 +14,9 @@ class RedisManager:
 
     async def connect(self) -> None:
         """Initialize Redis connection pool."""
+
+        if self.client is not None:
+            return
 
         self.client = redis.from_url(
             settings.redis_url,
