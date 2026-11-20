@@ -9,6 +9,11 @@ from fastapi import (
     status,
     Response,
 )
+from app.core.cache import (
+    get_cache,
+    set_cache,
+    delete_cache_pattern,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,13 +25,16 @@ from app.dependencies.permissions import admin_required
 from app.models.category import Category
 from app.models.user import User
 from app.schemas.category import CategoryResponse
-
+CATEGORY_CACHE_TTL = 600
 
 router = APIRouter(
     prefix="/categories",
     tags=["Categories"],
 )
 
+async def invalidate_category_cache() -> None:
+    await delete_cache_pattern("categories:*")
+    await delete_cache_pattern("products:*")
 
 # ============================================================
 # ADMIN ROUTES
@@ -118,6 +126,7 @@ async def create_category(
     try:
         await db.commit()
         await db.refresh(category)
+        await invalidate_category_cache()
     except Exception:
         await db.rollback()
         raise
@@ -218,6 +227,7 @@ async def update_category(
     try:
         await db.commit()
         await db.refresh(category)
+        await invalidate_category_cache()
     except Exception:
         await db.rollback()
         raise
@@ -262,6 +272,7 @@ async def delete_category(
     try:
         await db.delete(category)
         await db.commit()
+        await invalidate_category_cache()
     except Exception:
         await db.rollback()
         raise
@@ -289,6 +300,13 @@ async def delete_category(
 async def get_active_categories(
     db: AsyncSession = Depends(get_db),
 ):
+    cache_key = "categories:active:list"
+
+    cached_data = await get_cache(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
     result = await db.execute(
         select(Category)
         .where(Category.is_active.is_(True))
@@ -297,7 +315,18 @@ async def get_active_categories(
 
     categories = result.scalars().all()
 
-    return categories
+    response_data = [
+        CategoryResponse.model_validate(category).model_dump(mode="json")
+        for category in categories
+    ]
+
+    await set_cache(
+        cache_key,
+        response_data,
+        ttl=CATEGORY_CACHE_TTL,
+    )
+
+    return response_data
 
 
 # ============================================================
@@ -312,6 +341,13 @@ async def get_active_category(
     slug: str,
     db: AsyncSession = Depends(get_db),
 ):
+    cache_key = f"categories:detail:{slug}"
+
+    cached_data = await get_cache(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
     result = await db.execute(
         select(Category).where(
             Category.slug == slug,
@@ -327,4 +363,14 @@ async def get_active_category(
             detail="Category not found",
         )
 
-    return category
+    response_data = (
+        CategoryResponse.model_validate(category).model_dump(mode="json")
+    )
+
+    await set_cache(
+        cache_key,
+        response_data,
+        ttl=CATEGORY_CACHE_TTL,
+    )
+
+    return response_data

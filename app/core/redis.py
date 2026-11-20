@@ -1,3 +1,4 @@
+
 import logging
 
 import redis.asyncio as redis
@@ -13,12 +14,12 @@ class RedisManager:
         self.client: redis.Redis | None = None
 
     async def connect(self) -> None:
-        """Initialize Redis connection pool."""
+        """Create Redis connection pool and verify connectivity."""
 
         if self.client is not None:
             return
 
-        self.client = redis.from_url(
+        client = redis.from_url(
             settings.redis_url,
             decode_responses=True,
             socket_connect_timeout=5,
@@ -28,11 +29,15 @@ class RedisManager:
         )
 
         try:
-            await self.client.ping()
-            logger.info("Redis connected successfully")
+            await client.ping()
+        except RedisError:
+            await client.aclose()
+            logger.exception("Redis connection failed")
+            self.client = None
+            return
 
-        except RedisError as exc:
-            logger.warning("Redis is unavailable: %s", exc)
+        self.client = client
+        logger.info("Redis connected successfully")
 
     async def disconnect(self) -> None:
         """Close Redis connection pool."""
@@ -40,13 +45,10 @@ class RedisManager:
         if self.client is not None:
             await self.client.aclose()
             self.client = None
-            logger.info("Redis connection closed")
+            logger.info("Redis disconnected")
 
-    def get_client(self) -> redis.Redis:
-        """Return initialized Redis client."""
-
-        if self.client is None:
-            raise RuntimeError("Redis has not been initialized")
+    def get_client(self) -> redis.Redis | None:
+        """Return the client, or None when Redis is unavailable."""
 
         return self.client
 

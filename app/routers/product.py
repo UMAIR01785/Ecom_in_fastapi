@@ -1,7 +1,11 @@
 from decimal import Decimal
 from math import ceil
 from app.services.inventory_service import receive_product_inventory
-
+from app.core.cache import (
+    get_cache,
+    set_cache,
+    delete_cache_pattern,
+)
 from fastapi import (
     APIRouter,
     Depends,
@@ -173,6 +177,7 @@ async def create_product(
     # Re-query with categories loaded. This avoids async lazy-loading
     # when ProductResponse reads Product.category_slugs.
     saved_product = await get_product_with_categories(db, product_id)
+    await invalidate_product_cache()
 
     return saved_product
 
@@ -216,11 +221,16 @@ async def get_all_products_admin(
         "total_pages": total_pages,
     }
 
+PRODUCT_CACHE_TTL = 300
+
+PRODUCT_LIST_CACHE = "products:list:*"
+PRODUCT_CATEGORY_CACHE = "products:category:*"
+PRODUCT_DETAIL_CACHE = "products:detail:*"
+
 
 # ============================================================
 # CUSTOMER - GET ACTIVE PRODUCTS
 # ============================================================
-
 @router.get(
     "/",
     response_model=PaginatedResponse[ProductResponse],
@@ -230,17 +240,25 @@ async def get_products(
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
+    cache_key = f"products:list:page:{page}:limit:{limit}"
+
+    # 1. Check Redis
+    cached_data = await get_cache(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
+    # 2. Cache miss: query PostgreSQL
     filters = Product.is_active.is_(True)
 
-    # Count total active products
     total_result = await db.execute(
         select(func.count())
         .select_from(Product)
         .where(filters)
     )
+
     total = total_result.scalar_one()
 
-    # Fetch newest products first
     products_result = await db.execute(
         select(Product)
         .options(selectinload(Product.categories))
@@ -252,6 +270,7 @@ async def get_products(
 
     products = products_result.scalars().all()
 
+    # 3. Convert ORM objects to JSON-compatible dictionaries
     items = [
         ProductResponse.model_validate(product).model_dump(mode="json")
         for product in products
@@ -259,7 +278,7 @@ async def get_products(
 
     total_pages = ceil(total / limit) if total else 0
 
-    result= {
+    response_data = {
         "items": items,
         "total": total,
         "page": page,
@@ -267,14 +286,20 @@ async def get_products(
         "total_pages": total_pages,
     }
 
-    return result
+    # 4. Save result in Redis
+    await set_cache(
+        cache_key,
+        response_data,
+        ttl=PRODUCT_CACHE_TTL,
+    )
+
+    return response_data
 
 
 # ============================================================
 # CUSTOMER - GET PRODUCTS BY CATEGORY
 # Example: GET /shoes
 # ============================================================
-
 @router.get(
     "/{category_slug}",
     response_model=list[ProductResponse],
@@ -283,9 +308,20 @@ async def get_products_by_category(
     category_slug: str,
     db: AsyncSession = Depends(get_db),
 ):
+    cache_key = f"products:category:{category_slug}"
+
+    cached_data = await get_cache(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
     category_result = await db.execute(
-        select(Category.id).where(Category.slug == category_slug)
+        select(Category.id).where(
+            Category.slug == category_slug,
+            Category.is_active.is_(True),
+        )
     )
+
     category_id = category_result.scalar_one_or_none()
 
     if category_id is None:
@@ -304,14 +340,26 @@ async def get_products_by_category(
         .order_by(Product.id)
     )
 
-    return products_result.scalars().all()
+    products = products_result.scalars().all()
+
+    response_data = [
+        ProductResponse.model_validate(product).model_dump(mode="json")
+        for product in products
+    ]
+
+    await set_cache(
+        cache_key,
+        response_data,
+        ttl=PRODUCT_CACHE_TTL,
+    )
+
+    return response_data
 
 
 # ============================================================
 # CUSTOMER - GET SINGLE PRODUCT
 # Example: GET /shoes/nike-air-max
 # ============================================================
-
 @router.get(
     "/{category_slug}/{product_slug}",
     response_model=ProductResponse,
@@ -321,9 +369,22 @@ async def get_product(
     product_slug: str,
     db: AsyncSession = Depends(get_db),
 ):
-    category_result = await db.execute(
-        select(Category.id).where(Category.slug == category_slug)
+    cache_key = (
+        f"products:detail:{category_slug}:{product_slug}"
     )
+
+    cached_data = await get_cache(cache_key)
+
+    if cached_data is not None:
+        return cached_data
+
+    category_result = await db.execute(
+        select(Category.id).where(
+            Category.slug == category_slug,
+            Category.is_active.is_(True),
+        )
+    )
+
     category_id = category_result.scalar_one_or_none()
 
     if category_id is None:
@@ -341,6 +402,7 @@ async def get_product(
             Product.is_active.is_(True),
         )
     )
+
     product = product_result.scalar_one_or_none()
 
     if product is None:
@@ -349,7 +411,17 @@ async def get_product(
             detail="Product not found in this category",
         )
 
-    return product
+    response_data = (
+        ProductResponse.model_validate(product).model_dump(mode="json")
+    )
+
+    await set_cache(
+        cache_key,
+        response_data,
+        ttl=PRODUCT_CACHE_TTL,
+    )
+
+    return response_data
 
 
 # ============================================================
@@ -458,7 +530,7 @@ async def update_product(
         raise
 
     updated_product = await get_product_with_categories(db, product_id)
-
+    await invalidate_product_cache()
     return updated_product
 
 
@@ -502,7 +574,8 @@ async def delete_product(
             detail="Product not found in this category",
         )
     product.is_active = False  # Soft delete by marking as inactive
-    product.quantity = 0  # Soft delete by setting quantity to 0
+    product.quantity = 0
+    await invalidate_product_cache()  # Soft delete by setting quantity to 0
 
     try:
         await db.commit()
@@ -513,3 +586,6 @@ async def delete_product(
     return {
         "message": "Product deleted successfully"
     }
+
+async def invalidate_product_cache() -> None:
+    await delete_cache_pattern("products:*")
