@@ -288,9 +288,24 @@ async def add_to_cart(
         variant_id=variant_id,
     )
 
+    # Serialize mutations for this cart so concurrent requests cannot both
+    # observe a missing item and insert duplicate rows.
+    locked_cart_result = await db.execute(
+        select(Cart)
+        .where(Cart.id == cart.id)
+        .with_for_update()
+    )
+    locked_cart = locked_cart_result.scalar_one_or_none()
+
+    if locked_cart is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Cart not found",
+        )
+
     result = await db.execute(
         select(CartItem).where(
-            CartItem.cart_id == cart.id,
+            CartItem.cart_id == locked_cart.id,
             CartItem.product_id == product_id,
             CartItem.variant_id == variant_id,
         )
@@ -314,7 +329,7 @@ async def add_to_cart(
     else:
         db.add(
             CartItem(
-                cart_id=cart.id,
+                cart_id=locked_cart.id,
                 product_id=product_id,
                 variant_id=variant_id,
                 quantity=quantity,
@@ -508,6 +523,13 @@ async def merge_guest_cart_into_user_cart(
     guest_cart: Cart,
     user_cart: Cart,
 ) -> Cart:
+
+    locked_user_cart_result = await db.execute(
+        select(Cart)
+        .where(Cart.id == user_cart.id)
+        .with_for_update()
+    )
+    user_cart = locked_user_cart_result.scalar_one()
 
     for guest_item in guest_cart.items:
 

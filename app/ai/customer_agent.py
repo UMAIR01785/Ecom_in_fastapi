@@ -7,7 +7,7 @@ from langchain_core.messages import (
     HumanMessage,
     ToolMessage,
 )
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.llm import get_llm
 from app.ai.customer_prompts import get_customer_system_message
@@ -27,25 +27,26 @@ SHOPPING_TOOL_NAMES = {
     "get_cart",
     "update_cart_item",
     "remove_from_cart",
+    "place_order",
 }
 
-def run_customer_agent(
-    db: Session,
+
+async def run_customer_agent(
+    db: AsyncSession,
     history: list,
     cart=None,
     current_user=None,
     confirmation_authorized: bool = False,
 ) -> tuple[str, list[dict]]:
     """
-    Run the customer shopping agent.
+    Run the asynchronous customer shopping agent.
 
     Args:
-        db: Database session.
+        db: Asynchronous database session.
         history: Recent messages for this conversation.
         cart: Cart resolved by the backend.
         current_user: Authenticated user resolved by FastAPI.
-        confirmation_authorized: Must be verified by the backend,
-            not decided by the LLM.
+        confirmation_authorized: Must be verified by the backend.
 
     Returns:
         Assistant reply and structured product cards.
@@ -58,12 +59,16 @@ def run_customer_agent(
         confirmation_authorized=confirmation_authorized,
     )
 
-    tools_by_name = {tool.name: tool for tool in tools}
+    tools_by_name = {
+        selected_tool.name: selected_tool
+        for selected_tool in tools
+    }
 
     messages = [get_customer_system_message()]
 
     # Restore recent conversation context.
     for message in history[-MAX_HISTORY_MESSAGES:]:
+
         if message.role == "user":
             messages.append(
                 HumanMessage(content=message.content)
@@ -78,13 +83,18 @@ def run_customer_agent(
 
     # Product cards returned to the frontend.
     found_products: dict[int, dict] = {}
+    executed_adds: dict[tuple[int, int, int | None], dict] = {}
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = llm_with_tools.invoke(messages)
+
+        # Asynchronous LLM execution.
+        response = await llm_with_tools.ainvoke(messages)
+
         messages.append(response)
 
         # The model has finished its response.
         if not response.tool_calls:
+
             content = response.content
 
             if isinstance(content, str):
@@ -108,14 +118,17 @@ def run_customer_agent(
 
             return answer, list(found_products.values())
 
-        # Execute requested tools.
+        # Execute requested tools sequentially.
+        # Do not run these concurrently using the same AsyncSession.
         for tool_call in response.tool_calls:
+
             tool_name = tool_call["name"]
             tool_call_id = tool_call["id"]
-            tool = tools_by_name.get(tool_name)
+
+            selected_tool = tools_by_name.get(tool_name)
 
             if (
-                tool is None
+                selected_tool is None
                 or tool_name not in SHOPPING_TOOL_NAMES
             ):
                 result = {
@@ -127,7 +140,6 @@ def run_customer_agent(
                 tool_name == "place_order"
                 and not confirmation_authorized
             ):
-                # Do not allow the model to authorize its own checkout.
                 result = {
                     "success": False,
                     "message": (
@@ -150,12 +162,34 @@ def run_customer_agent(
 
             else:
                 try:
-                    result = tool.invoke(tool_call["args"])
+                    tool_args = tool_call["args"]
+
+                    if tool_name == "add_to_cart":
+                        add_key = (
+                            int(tool_args["product_id"]),
+                            int(tool_args.get("quantity", 1)),
+                            (
+                                int(tool_args["variant_id"])
+                                if tool_args.get("variant_id") is not None
+                                else None
+                            ),
+                        )
+
+                        if add_key in executed_adds:
+                            result = executed_adds[add_key]
+                        else:
+                            result = await selected_tool.ainvoke(tool_args)
+                            executed_adds[add_key] = result
+                    else:
+                        # Asynchronous LangChain tool execution.
+                        result = await selected_tool.ainvoke(tool_args)
 
                     if not isinstance(result, dict):
                         result = {
                             "success": False,
-                            "error": "Tool returned an unexpected result.",
+                            "error": (
+                                "Tool returned an unexpected result."
+                            ),
                         }
 
                     # Collect product cards from searches.
@@ -164,6 +198,7 @@ def run_customer_agent(
                         and not result.get("error")
                     ):
                         for product in result.get("products", []):
+
                             product_id = product.get("id")
 
                             if product_id is not None:
@@ -171,6 +206,7 @@ def run_customer_agent(
 
                     # Collect product cards from detail lookup.
                     elif tool_name == "get_product_details":
+
                         product = result.get("product")
 
                         if (

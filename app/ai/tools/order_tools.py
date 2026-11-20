@@ -1,17 +1,24 @@
-from sqlalchemy.orm import Session
+
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 from langchain_core.tools import tool
 
 from app.models.order import Order, OrderStatus
 
 
-def create_order_tools(db: Session):
+def create_order_tools(db: AsyncSession):
+
     @tool
-    def get_order_summary(status: str = "all") -> dict:
+    async def get_order_summary(status: str = "all") -> dict:
         """Count orders and sum their order totals.
         Status can be all, pending, confirmed, processing,
         shipped, delivered, or cancelled.
         """
-        query = db.query(Order)
+
+        query = select(
+            func.count(Order.id),
+            func.coalesce(func.sum(Order.total_amount), 0),
+        )
 
         if status.lower() != "all":
             try:
@@ -19,25 +26,28 @@ def create_order_tools(db: Session):
             except ValueError:
                 return {"error": "Invalid order status"}
 
-            query = query.filter(Order.status == selected_status)
+            query = query.where(Order.status == selected_status)
 
-        orders = query.all()
+        result = await db.execute(query)
+        order_count, total_order_value = result.one()
 
         return {
             "status_filter": status.lower(),
-            "order_count": len(orders),
-            "total_order_value": str(
-                sum((order.total_amount for order in orders), start=0)
-            ),
+            "order_count": order_count,
+            "total_order_value": str(total_order_value),
         }
 
     @tool
-    def list_orders(status: str = "all", limit: int = 10) -> dict:
+    async def list_orders(
+        status: str = "all",
+        limit: int = 10,
+    ) -> dict:
         """List recent orders. Limit must be between 1 and 20."""
+
         if not 1 <= limit <= 20:
             return {"error": "Limit must be between 1 and 20"}
 
-        query = db.query(Order)
+        query = select(Order)
 
         if status.lower() != "all":
             try:
@@ -45,13 +55,12 @@ def create_order_tools(db: Session):
             except ValueError:
                 return {"error": "Invalid order status"}
 
-            query = query.filter(Order.status == selected_status)
+            query = query.where(Order.status == selected_status)
 
-        orders = (
-            query.order_by(Order.id.desc())
-            .limit(limit)
-            .all()
-        )
+        query = query.order_by(Order.id.desc()).limit(limit)
+
+        result = await db.execute(query)
+        orders = result.scalars().all()
 
         return {
             "orders": [
@@ -66,9 +75,17 @@ def create_order_tools(db: Session):
         }
 
     @tool
-    def get_order_details(order_id: int) -> dict:
+    async def get_order_details(order_id: int) -> dict:
         """Retrieve an order by its ID."""
-        order = db.query(Order).filter(Order.id == order_id).first()
+
+        if order_id <= 0:
+            return {"error": "Invalid order ID"}
+
+        result = await db.execute(
+            select(Order).where(Order.id == order_id)
+        )
+
+        order = result.scalar_one_or_none()
 
         if not order:
             return {"error": "Order not found"}
@@ -85,10 +102,14 @@ def create_order_tools(db: Session):
         }
 
     @tool
-    def update_order_status(order_id: int, new_status: str) -> dict:
+    async def update_order_status(
+        order_id: int,
+        new_status: str,
+    ) -> dict:
         """Advance an order through permitted statuses.
         Cancellation must use the existing cancellation service.
         """
+
         allowed_transitions = {
             OrderStatus.PENDING: {OrderStatus.CONFIRMED},
             OrderStatus.CONFIRMED: {OrderStatus.PROCESSING},
@@ -96,7 +117,16 @@ def create_order_tools(db: Session):
             OrderStatus.SHIPPED: {OrderStatus.DELIVERED},
         }
 
-        order = db.query(Order).filter(Order.id == order_id).first()
+        if order_id <= 0:
+            return {"error": "Invalid order ID"}
+
+        result = await db.execute(
+            select(Order)
+            .where(Order.id == order_id)
+            .with_for_update()
+        )
+
+        order = result.scalar_one_or_none()
 
         if not order:
             return {"error": "Order not found"}
@@ -117,10 +147,12 @@ def create_order_tools(db: Session):
 
         try:
             order.status = target
-            db.commit()
-            db.refresh(order)
+
+            await db.commit()
+            await db.refresh(order)
+
         except Exception:
-            db.rollback()
+            await db.rollback()
             raise
 
         return {

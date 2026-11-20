@@ -1,7 +1,7 @@
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, UniqueConstraint
+from sqlalchemy import ForeignKey, Index, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -88,5 +88,12 @@ class CartItem(Base):
             "product_id",
             "variant_id",
             name="uq_cart_product_variant",
+        ),
+        Index(
+            "uq_cart_product_without_variant",
+            "cart_id",
+            "product_id",
+            unique=True,
+            postgresql_where=text("variant_id IS NULL"),
         ),
     )

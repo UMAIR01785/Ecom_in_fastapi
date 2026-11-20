@@ -154,7 +154,8 @@ async def add_item(
                 value=guest_id,
                 httponly=True,
                 samesite="lax",
-                secure=False,
+                secure=request.url.scheme == "https",
+                path="/",
                 max_age=60 * 60 * 24 * 30,
             )
 

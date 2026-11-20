@@ -1,4 +1,6 @@
 from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from app.core.redis import redis_manager
 from app.routers.auth import router as auth_router
 from app.routers.profile import router as profile_router
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +19,21 @@ from app.routers.refund import router as refund_router
 from app.routers.admin_chat import router as admin_chat_router
 from app.routers.shopping_chat import router as shopping_chat_router
 from app.routers import inventory_lots
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await redis_manager.connect()
+
+    yield
+
+    await redis_manager.disconnect()
+
+
 app = FastAPI(
     title="E-Commerce API",
     description="Backend API for an e-commerce platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.include_router(shopping_chat_router)
